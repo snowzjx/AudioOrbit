@@ -9,21 +9,22 @@ Apple requires a Developer ID Application signature, Hardened Runtime, a secure 
 1. Confirm the Apple Developer Program membership is active.
 2. In **Certificates, Identifiers & Profiles**, optionally register the explicit App ID `me.snowzjx.AudioOrbit`. This is recommended for a stable product identity and future capabilities, although the current direct build does not need a provisioning profile.
 3. Confirm Keychain Access contains `Developer ID Application: Junxue ZHANG (A47Y4XPLXR)` with its private key.
-4. Create an app-specific password for the Apple ID used for notarization. Do not put this password in the repository or a shell script.
+4. Confirm that you have a **team** App Store Connect API key, its Key ID, its Issuer ID and the downloaded `AuthKey_<KEY_ID>.p8` private key. AudioOrbit uses this key for notarization; no app-specific password is required. Individual App Store Connect API keys cannot authenticate `notarytool`.
 
 Changing from the old development bundle identifier causes macOS to treat AudioOrbit as a new app. Remove any old AudioOrbit entries from **Privacy & Security → Accessibility** and **Screen & System Audio Recording**, then grant the new signed build access once.
 
 ## 2. Store local notarization credentials
 
-Run this command in Terminal:
+Run this command in Terminal, replacing the three placeholders with the existing team-key values used for RelatedWorks:
 
 ```sh
 xcrun notarytool store-credentials AudioOrbit-Notary \
-  --apple-id "YOUR_APPLE_ID" \
-  --team-id A47Y4XPLXR
+  --key "/secure/path/AuthKey_YOUR_KEY_ID.p8" \
+  --key-id "YOUR_KEY_ID" \
+  --issuer "YOUR_ISSUER_UUID"
 ```
 
-`notarytool` securely prompts for the app-specific password and validates the credentials before storing them in Keychain. Do not add `--password` on the command line.
+`notarytool` validates the API key before saving the credentials in Keychain. Keep the `.p8` file private and outside the repository. Apple permits downloading a private key only once; if the existing file was lost, revoke that key and create a new team key in **App Store Connect → Users and Access → Integrations → Team Keys**.
 
 ## 3. Build and notarize locally
 
@@ -51,8 +52,9 @@ Export only the Developer ID Application certificate and its private key from Ke
 | `MACOS_CERTIFICATE_P12` | Base64 text of the exported Developer ID `.p12` |
 | `MACOS_CERTIFICATE_PASSWORD` | Password chosen while exporting the `.p12` |
 | `MACOS_TEAM_ID` | `A47Y4XPLXR` |
-| `APPLE_ID` | Apple ID used for notarization |
-| `APPLE_APP_PASSWORD` | App-specific password, not the normal Apple ID password |
+| `APPSTORE_API_KEY_P8` | Base64 text of the team App Store Connect `.p8` key |
+| `APPSTORE_API_KEY_ID` | Team API Key ID |
+| `APPSTORE_API_ISSUER_ID` | Team API Issuer ID |
 
 Create the base64 value locally:
 
@@ -60,7 +62,13 @@ Create the base64 value locally:
 base64 -i DeveloperIDApplication.p12 | pbcopy
 ```
 
-Paste the clipboard into the `MACOS_CERTIFICATE_P12` secret, then securely delete the exported `.p12` when it is no longer needed. GitHub's automatically generated `GITHUB_TOKEN` creates the release; no personal access token is required.
+Paste the clipboard into the `MACOS_CERTIFICATE_P12` secret. Encode the API key the same way and paste that value into `APPSTORE_API_KEY_P8`:
+
+```sh
+base64 -i AuthKey_YOUR_KEY_ID.p8 | pbcopy
+```
+
+Securely delete temporary certificate exports when they are no longer needed. Keep the original API key in secure storage. GitHub's automatically generated `GITHUB_TOKEN` creates the release; no personal access token is required.
 
 ## 5. Publish a GitHub release
 

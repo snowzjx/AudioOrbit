@@ -82,14 +82,17 @@ jobs:
 
       - name: Notarize and staple
         env:
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
-          MACOS_TEAM_ID: ${{ secrets.MACOS_TEAM_ID }}
+          APPSTORE_API_KEY_P8: ${{ secrets.APPSTORE_API_KEY_P8 }}
+          APPSTORE_API_KEY_ID: ${{ secrets.APPSTORE_API_KEY_ID }}
+          APPSTORE_API_ISSUER_ID: ${{ secrets.APPSTORE_API_ISSUER_ID }}
         run: |
+          AUTH_KEY_PATH="$RUNNER_TEMP/AuthKey_${APPSTORE_API_KEY_ID}.p8"
+          echo "$APPSTORE_API_KEY_P8" | base64 --decode > "$AUTH_KEY_PATH"
+          chmod 600 "$AUTH_KEY_PATH"
           xcrun notarytool submit build/AudioOrbit-notarize.zip \
-            --apple-id "$APPLE_ID" \
-            --password "$APPLE_APP_PASSWORD" \
-            --team-id "$MACOS_TEAM_ID" \
+            --key "$AUTH_KEY_PATH" \
+            --key-id "$APPSTORE_API_KEY_ID" \
+            --issuer "$APPSTORE_API_ISSUER_ID" \
             --wait \
             --output-format json > build/notary-result.json
           cat build/notary-result.json
@@ -97,9 +100,9 @@ jobs:
           STATUS="$(jq -r '.status' build/notary-result.json)"
           if [[ "$STATUS" != "Accepted" ]]; then
             xcrun notarytool log "$SUBMISSION_ID" \
-              --apple-id "$APPLE_ID" \
-              --password "$APPLE_APP_PASSWORD" \
-              --team-id "$MACOS_TEAM_ID" || true
+              --key "$AUTH_KEY_PATH" \
+              --key-id "$APPSTORE_API_KEY_ID" \
+              --issuer "$APPSTORE_API_ISSUER_ID" || true
             exit 1
           fi
           APP_PATH="build/AudioOrbit.xcarchive/Products/Applications/AudioOrbit.app"

@@ -21,6 +21,7 @@ final class AppModel: ObservableObject {
     @Published private(set) var automaticRoutingMessage: String?
     @Published private(set) var headphoneOverrideEnabled = false
     @Published private(set) var headphoneOverrideDeviceUID: String?
+    @Published private(set) var ignoredApplications: [IgnoredApplication] = []
     @Published private(set) var lastError: String?
     @Published private(set) var supportReportPreview = ""
     @Published private(set) var supportReportExportMessage: String?
@@ -78,6 +79,8 @@ final class AppModel: ObservableObject {
         var hasCandidate = false
         var candidateDisplayUUID: UUID?
         var committedDisplayUUID: UUID?
+        var committedWindowIdentifier: String?
+        var wasRunningOutput: Bool?
         var association: ProcessWindowAssociation?
         var evidence: WindowDisplayEvidence?
         var decisionTask: Task<Void, Never>?
@@ -187,6 +190,7 @@ final class AppModel: ObservableObject {
         mappings = loadedConfiguration.configuration.mappings
         automaticRoutingEnabled = loadedConfiguration.configuration.routingEnabled
         cachedApplicationRoutes = loadedConfiguration.configuration.cachedRoutes
+        ignoredApplications = loadedConfiguration.configuration.ignoredApplications
         headphoneOverrideEnabled = loadedConfiguration.configuration.headphoneOverrideEnabled
         headphoneOverrideDeviceUID = loadedConfiguration.configuration.headphoneOverrideDeviceUID
         publishRoutes()
@@ -364,22 +368,64 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func deleteRoute(_ routeID: UUID) async {
-        if let session = sessions[routeID] {
-            suppressedAutomaticSourcePIDs.insert(session.sourcePID)
-            if let bundleIdentifier = session.applicationBundleIdentifier {
-                cachedApplicationRoutes.removeAll {
-                    $0.applicationBundleIdentifier == bundleIdentifier
-                }
+    func ignoreRoute(_ routeID: UUID) async {
+        let session = sessions[routeID]
+        let cachedRoute = cachedApplicationRoutes.first { $0.id == routeID }
+        guard let bundleIdentifier = session?.applicationBundleIdentifier
+                ?? cachedRoute?.applicationBundleIdentifier else {
+            if let session {
+                suppressedAutomaticSourcePIDs.insert(session.sourcePID)
+                await stopRoute(routeID, preserveAutomaticMode: true)
+                lastError = "The route was stopped, but this process has no stable application identifier and cannot be ignored permanently."
             }
-            persistConfiguration()
-            await stopRoute(routeID, preserveAutomaticMode: true)
             publishRoutes()
             return
         }
-        cachedApplicationRoutes.removeAll { $0.id == routeID }
+
+        let applicationName = session?.sourceName
+            ?? cachedRoute?.applicationName
+            ?? bundleIdentifier
+        ignoreApplication(
+            bundleIdentifier: bundleIdentifier,
+            applicationName: applicationName
+        )
+
+        let matchingSourcePIDs = processes
+            .filter { automaticApplicationBundleIdentifier(for: $0) == bundleIdentifier }
+            .map(\.pid)
+        for sourcePID in matchingSourcePIDs {
+            suppressedAutomaticSourcePIDs.insert(sourcePID)
+            automaticTracking[sourcePID]?.decisionTask?.cancel()
+            automaticTracking.removeValue(forKey: sourcePID)
+        }
+        let matchingRouteIDs = sessions.values
+            .filter { $0.applicationBundleIdentifier == bundleIdentifier }
+            .map(\.id)
+        for matchingRouteID in matchingRouteIDs {
+            guard let matchingSession = sessions[matchingRouteID] else { continue }
+            suppressedAutomaticSourcePIDs.insert(matchingSession.sourcePID)
+            automaticTracking[matchingSession.sourcePID]?.decisionTask?.cancel()
+            automaticTracking.removeValue(forKey: matchingSession.sourcePID)
+            await stopRoute(matchingRouteID, preserveAutomaticMode: true)
+        }
         persistConfiguration()
+        updateAutomaticRoutingSummary()
         publishRoutes()
+    }
+
+    func allowIgnoredApplication(_ bundleIdentifier: String) async {
+        ignoredApplications.removeAll {
+            $0.applicationBundleIdentifier == bundleIdentifier
+        }
+        for source in processes where automaticApplicationBundleIdentifier(for: source)
+            == bundleIdentifier {
+            suppressedAutomaticSourcePIDs.remove(source.pid)
+        }
+        persistConfiguration()
+        if automaticRoutingEnabled {
+            ensureWindowObservation()
+            await refreshAutomaticWindowEvidence(forceImmediate: true)
+        }
     }
 
     func setAutomaticRoutingEnabled(_ enabled: Bool) async {
@@ -908,6 +954,7 @@ final class AppModel: ObservableObject {
                 mappings: mappings,
                 routingEnabled: automaticRoutingEnabled,
                 cachedRoutes: cachedApplicationRoutes,
+                ignoredApplications: ignoredApplications,
                 headphoneOverrideEnabled: headphoneOverrideEnabled,
                 headphoneOverrideDeviceUID: headphoneOverrideDeviceUID
             ))
@@ -923,9 +970,17 @@ final class AppModel: ObservableObject {
         guard automaticRoutingEnabled else { return }
         let currentlyPlayingPIDs = Set(processes.filter(\.isRunningOutput).map(\.pid))
         suppressedAutomaticSourcePIDs.formIntersection(currentlyPlayingPIDs)
-        let sources = processes.filter {
-            ($0.isRunningOutput && !suppressedAutomaticSourcePIDs.contains($0.pid))
-                || automaticRouteIDs[$0.pid] != nil
+        let sources = processes.filter { source in
+            let isRelevant = (source.isRunningOutput
+                && !suppressedAutomaticSourcePIDs.contains(source.pid))
+                || automaticRouteIDs[source.pid] != nil
+            guard isRelevant else { return false }
+            let association = processWindowResolver.resolve(source)
+            return AutomaticRouteEligibilityPolicy.shouldManage(
+                source: source,
+                association: association,
+                ignoredBundleIdentifiers: ignoredBundleIdentifiers
+            )
         }
         let currentPIDs = Set(processes.map(\.pid))
         let trackedPIDs = Set(automaticTracking.keys).union(automaticRouteIDs.keys)
@@ -934,6 +989,17 @@ final class AppModel: ObservableObject {
             automaticTracking[pid]?.decisionTask?.cancel()
             automaticTracking.removeValue(forKey: pid)
             await stopAutomaticRoute(for: pid)
+        }
+
+        for source in processes {
+            guard let state = automaticTracking[source.pid] else { continue }
+            if WindowRouteAffinityPolicy.beginsNewPlaybackSession(
+                wasRunningOutput: state.wasRunningOutput,
+                isRunningOutput: source.isRunningOutput
+            ) {
+                state.committedWindowIdentifier = nil
+            }
+            state.wasRunningOutput = source.isRunningOutput
         }
 
         if let overrideDevice = activeHeadphoneOverrideDevice {
@@ -955,13 +1021,20 @@ final class AppModel: ObservableObject {
                 continue
             }
             let committedDisplayUUID = automaticTracking[source.pid]?.committedDisplayUUID
+            let preferredWindowIdentifier = automaticTracking[source.pid]
+                .flatMap { state in
+                    WindowRouteAffinityPolicy.pinsInitialWindow(for: association.reason)
+                        ? state.committedWindowIdentifier
+                        : nil
+                }
             let evidence = await Task.detached(priority: .utility) {
                 AccessibilityWindowDiscovery().evidence(
                     for: source,
                     windowOwner: association.windowOwner,
                     associationReason: association.reason,
                     displays: currentDisplays,
-                    committedDisplayUUID: committedDisplayUUID
+                    committedDisplayUUID: committedDisplayUUID,
+                    preferredWindowIdentifier: preferredWindowIdentifier
                 )
             }.value
             scheduleAutomaticRouteDecision(
@@ -1032,8 +1105,16 @@ final class AppModel: ObservableObject {
         guard automaticRoutingEnabled else { return }
         let state = automaticTracking[source.pid] ?? AutomaticTrackingState()
         automaticTracking[source.pid] = state
+        state.wasRunningOutput = source.isRunningOutput
         state.association = association
         state.evidence = evidence
+        if let association {
+            state.committedWindowIdentifier = WindowRouteAffinityPolicy.routeAnchor(
+                existing: state.committedWindowIdentifier,
+                selected: evidence?.selectedWindowIdentifier,
+                associationReason: association.reason
+            )
+        }
         let candidateDisplayUUID = evidence?.displayUUID
 
         // Native and HTML video fullscreen transitions can temporarily remove
@@ -1134,6 +1215,11 @@ final class AppModel: ObservableObject {
             updateAutomaticRoutingSummary()
             return
         }
+        state.committedWindowIdentifier = WindowRouteAffinityPolicy.routeAnchor(
+            existing: state.committedWindowIdentifier,
+            selected: state.evidence?.selectedWindowIdentifier,
+            associationReason: association.reason
+        )
 
         if let routeID = automaticRouteIDs[sourcePID],
            let session = sessions[routeID] {
@@ -1258,7 +1344,8 @@ final class AppModel: ObservableObject {
     private func cacheAutomaticSession(_ session: RouteSession) {
         guard session.isAutomatic,
               session.followedDisplayName != "Headphone Override",
-              let bundleIdentifier = session.applicationBundleIdentifier else { return }
+              let bundleIdentifier = session.applicationBundleIdentifier,
+              !ignoredBundleIdentifiers.contains(bundleIdentifier) else { return }
         let cached = CachedApplicationRoute(
             id: cachedApplicationRoutes.first(where: {
                 $0.applicationBundleIdentifier == bundleIdentifier
@@ -1279,6 +1366,42 @@ final class AppModel: ObservableObject {
             cachedApplicationRoutes.append(cached)
         }
         persistConfiguration()
+    }
+
+    private var ignoredBundleIdentifiers: Set<String> {
+        Set(ignoredApplications.map(\.applicationBundleIdentifier))
+    }
+
+    private func automaticApplicationBundleIdentifier(
+        for source: AudioProcessSnapshot
+    ) -> String? {
+        AutomaticRouteEligibilityPolicy.applicationBundleIdentifier(
+            source: source,
+            association: processWindowResolver.resolve(source)
+        )
+    }
+
+    private func ignoreApplication(
+        bundleIdentifier: String,
+        applicationName: String
+    ) {
+        cachedApplicationRoutes.removeAll {
+            $0.applicationBundleIdentifier == bundleIdentifier
+        }
+        let ignored = IgnoredApplication(
+            applicationBundleIdentifier: bundleIdentifier,
+            applicationName: applicationName
+        )
+        if let index = ignoredApplications.firstIndex(where: {
+            $0.applicationBundleIdentifier == bundleIdentifier
+        }) {
+            ignoredApplications[index] = ignored
+        } else {
+            ignoredApplications.append(ignored)
+        }
+        ignoredApplications.sort {
+            $0.applicationName.localizedStandardCompare($1.applicationName) == .orderedAscending
+        }
     }
 
     private func updateAutomaticRoutingSummary() {

@@ -120,14 +120,16 @@ struct MenuBarView: View {
             }
             Spacer()
             Button(role: .destructive) {
-                Task { await model.deleteRoute(route.id) }
+                Task { await model.ignoreRoute(route.id) }
             } label: {
                 Image(systemName: "trash")
             }
             .buttonStyle(.plain)
             .foregroundStyle(.secondary)
-            .help(route.isCached ? "Delete this remembered route" : "Stop and forget this route")
-            .accessibilityLabel("Delete route for \(route.sourceName)")
+            .help(route.isCached
+                ? "Ignore this application"
+                : "Stop and ignore this application")
+            .accessibilityLabel("Ignore \(route.sourceName)")
         }
         .padding(12)
         .glassCard(cornerRadius: 14)

@@ -100,15 +100,17 @@ The following are explicitly outside v1:
 ### Implemented product extensions
 
 - [x] Remember application routes by bundle identifier until the user deletes them.
+- [x] Persistently ignore an application after its route is removed, with an explicit Allow Again action.
 - [x] Physical-device volume controls for outputs with a writable public Core Audio scalar.
 - [x] User-selected Headphone Override with automatic display-route restoration on disconnect.
 - [x] Conservative Safari/WebKit helper association and established-route retention through full-screen transitions.
+- [x] Playback-window affinity for helper processes so unrelated focus changes do not move established routes.
 - [x] Layered Icon Composer app icon with Default, Dark and Mono appearances and generated legacy-macOS artwork.
 
 ### Optional only after required behavior is stable
 
 - [ ] Launch at login.
-- [ ] Per-application exclude/pass-through list.
+- [x] Per-application exclude/pass-through list.
 - [ ] Configurable debounce duration in an Advanced settings section.
 - [x] Menu-bar display of live and remembered routes with application icons.
 
@@ -143,6 +145,8 @@ The menu-bar popover shows:
 - A concise reason for any degraded route.
 - Physical-output volume sliders when supported by the device.
 - A SwiftUI `SettingsLink` and a button-styled **Quit AudioOrbit** action.
+
+Removing a route creates a persistent application-level ignore rule keyed by the visible application's bundle identifier. AudioOrbit must leave that application on normal macOS playback and must not recreate, restore, or override its routes—including during Headphone Override—until the user explicitly chooses **Allow Again** in Settings. Associated audio helpers, such as Safari's media process, inherit the visible application's rule.
 
 Right-clicking the status item exposes quick Enable/Disable and Quit actions without displaying a checkbox tick.
 
@@ -286,6 +290,8 @@ Evaluate in this order:
 3. The eligible normal window with the greatest visible area on all active displays; break ties by front-to-back window order, then stable window identifier.
 4. If no eligible window exists, retain the last valid selected window/display for a grace period of 1 second.
 5. After the grace period, stop AudioOrbit routing for that process and return it to pass-through.
+
+For an audio helper associated with a separate visible application process, the first selected window becomes that route's playback-window anchor. Subsequent focus changes to another window of the same application must not move the established route. Resolve the anchor with a stable public Core Graphics window number where possible. If the anchored window temporarily disappears during a full-screen or Space transition, retain the last committed display instead of falling back to another focused window. Moving the anchored window itself may still move the route after the normal display dwell and hysteresis policy. A confirmed audio-output stop followed by a new start on a reused helper process begins a new playback session and releases the old window anchor.
 
 An eligible window must:
 
@@ -509,7 +515,7 @@ Do not request broader Screen Recording access merely to capture pixels; AudioOr
 Tabs or sections:
 
 1. **Displays** — one full-width card/row per display with output picker and connection state. A generated test tone remains future work.
-2. **General** — remembered routes and Headphone Override configuration.
+2. **General** — ignored applications with **Allow Again** actions, plus Headphone Override configuration. Remembered routes are not edited here.
 3. **Permissions** — current permission state, explanations, recheck, and open-settings actions.
 
 Raw process selection, buffer counters, manual feasibility controls, and OSStatus details are not exposed in the end-user Settings window. A separately gated support-report flow may expose redacted diagnostics in a later milestone.
@@ -533,6 +539,7 @@ struct PersistedConfiguration: Codable {
     var mappings: [DisplayAudioMapping]
     var routingEnabled: Bool
     var cachedRoutes: [CachedApplicationRoute]
+    var ignoredApplications: [IgnoredApplication]
     var headphoneOverrideEnabled: Bool
     var headphoneOverrideDeviceUID: String?
 }
@@ -540,7 +547,7 @@ struct PersistedConfiguration: Codable {
 
 Requirements:
 
-- The current schema is version 2 and migrates version 1 display mappings and routing state.
+- The current schema is version 3 and migrates version 1 and 2 display mappings, routing state, remembered routes and Headphone Override settings.
 - Perform decoding and migration off the real-time path.
 - Validate ranges and enum values; preserve a backup of the last readable configuration before migration.
 - Write atomically.
@@ -548,6 +555,8 @@ Requirements:
 - Never persist permission assumptions, PIDs, `AudioObjectID`s, tap IDs, aggregate-device IDs, or audio buffers.
 - Persist user mappings even while their hardware is absent.
 - Persist remembered application intent by bundle identifier, never by PID.
+- Persist ignored applications by the visible application's bundle identifier, never by PID or helper-process identity. An application cannot be both remembered and ignored.
+- Exclude ignored applications from display routing, remembered-route restoration and Headphone Override until the user removes the ignore rule.
 - Headphone Override stores one explicitly selected output UID and becomes active only while that exact output is alive.
 - Headphone Override never replaces an application's remembered display destination; its route labels and temporary destinations are cleared on disconnect.
 
@@ -635,6 +644,8 @@ Exclude audio data, window titles by default, user document paths, and unrelated
 - [x] Ring-buffer behavior using a non-real-time test harness, including wraparound, underflow and overflow policy.
 - [x] Sample-rate conversion, adaptive correction, startup priming and switch-backlog rebasing.
 - [x] Conservative process/window association, including Safari/WebKit helpers and ambiguity rejection.
+- [x] Persistent application ignore policy, including inherited exclusion of associated Safari/WebKit helpers.
+- [x] Playback-window affinity prevents an unrelated focused window from replacing an established helper route's anchor.
 
 ### 21.2 Integration tests with fakes
 
@@ -673,7 +684,7 @@ Test on the minimum OS and the latest supported macOS release with:
 
 Automated tests must not assume particular hardware names or UIDs.
 
-The current automated suite contains 50 passing tests. Checked items above mean deterministic coverage exists in this repository; unchecked hardware and failure-injection items remain required even when related behavior has been exercised manually.
+The current automated suite contains 55 passing tests. Checked items above mean deterministic coverage exists in this repository; unchecked hardware and failure-injection items remain required even when related behavior has been exercised manually.
 
 ## 22. Milestones
 
@@ -698,7 +709,7 @@ Core feasibility is complete and ADR-001 accepts the current architecture for th
 - [x] Create app target, test target, module boundaries, dependency root and hosted macOS CI workflow.
 - [x] Implement display and audio-device enumeration with stable IDs and listeners.
 - [x] Implement permission remediation, deterministic revocation policy and first-launch onboarding.
-- [x] Implement versioned mapping, remembered-route and Headphone Override persistence with migration and corrupt-file recovery.
+- [x] Implement versioned mapping, remembered-route, ignored-application and Headphone Override persistence with migration and corrupt-file recovery.
 
 ### Milestone 2 — Window tracking and route decisions
 
@@ -779,7 +790,7 @@ Set final numeric budgets from Milestone 0 measurements and target hardware, the
 7. Build and run the relevant tests after every module-level change.
 8. Preserve existing user changes and avoid destructive repository operations.
 9. When an Apple API's behavior is unclear, build the smallest instrumented experiment and record the result; do not invent behavior.
-10. Keep a `KNOWN_LIMITATIONS.md` file current as hardware/application exceptions are discovered.
+10. Record product limitations in this specification, architecture constraints in ADR-001, and unresolved release validation in the release checklist.
 
 ### Current repository shape
 
@@ -797,9 +808,12 @@ AudioOrbit/
 AudioOrbitTests/
 Config/
 docs/
-└── ADR-001-audio-routing-engine.md
+├── ADR-001-audio-routing-engine.md
+├── DISTRIBUTION.md
+├── PERFORMANCE_BUDGETS.md
+└── RELEASE_CHECKLIST.md
 PROJECT_SPEC.md
-KNOWN_LIMITATIONS.md
+README.md
 ```
 
 Add new boundaries only when a milestone needs them; do not reorganize working real-time code solely for cosmetic structure.

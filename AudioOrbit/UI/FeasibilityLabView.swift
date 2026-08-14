@@ -12,7 +12,7 @@ struct AudioOrbitSettingsView: View {
 
             settingsPage {
                 headphoneOverride
-                rememberedRoutes
+                ignoredApplications
             }
             .tabItem { Label("General", systemImage: "gearshape") }
 
@@ -128,31 +128,38 @@ struct AudioOrbitSettingsView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    private var rememberedRoutes: some View {
-        GroupBox("Remembered routes") {
+    private var ignoredApplications: some View {
+        GroupBox("Ignored applications") {
             VStack(alignment: .leading, spacing: 10) {
-                Text("AudioOrbit remembers an application after its first route and reconnects it when the application returns.")
+                Text("AudioOrbit never routes these applications, including during Headphone Override. Allow an application again to resume automatic routing.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
 
-                let remembered = model.routes.filter(\.isCached)
-                if remembered.isEmpty {
-                    Text("No inactive routes are remembered.")
+                if model.ignoredApplications.isEmpty {
+                    Text("No applications are ignored.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 } else {
-                    ForEach(remembered) { route in
-                        HStack {
+                    ForEach(model.ignoredApplications) { application in
+                        HStack(spacing: 10) {
+                            ignoredApplicationIcon(application.applicationBundleIdentifier)
                             VStack(alignment: .leading, spacing: 2) {
-                                Text(route.sourceName).font(.subheadline.weight(.medium))
-                                Text("\(route.followedDisplayName ?? "Last display") → \(route.destinationName)")
+                                Text(application.applicationName)
+                                    .font(.subheadline.weight(.medium))
+                                Text(application.applicationBundleIdentifier)
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                             }
                             Spacer()
-                            Button("Delete", role: .destructive) {
-                                Task { await model.deleteRoute(route.id) }
+                            Button("Allow Again") {
+                                Task {
+                                    await model.allowIgnoredApplication(
+                                        application.applicationBundleIdentifier
+                                    )
+                                }
                             }
+                            .buttonStyle(.bordered)
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(10)
@@ -164,6 +171,26 @@ struct AudioOrbitSettingsView: View {
             .padding(.top, 4)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func ignoredApplicationIcon(_ bundleIdentifier: String) -> some View {
+        Group {
+            if let applicationURL = NSWorkspace.shared.urlForApplication(
+                withBundleIdentifier: bundleIdentifier
+            ) {
+                Image(nsImage: NSWorkspace.shared.icon(forFile: applicationURL.path))
+                    .resizable()
+                    .scaledToFit()
+            } else {
+                Image(systemName: "app.fill")
+                    .resizable()
+                    .scaledToFit()
+                    .foregroundStyle(.secondary)
+                    .padding(3)
+            }
+        }
+        .frame(width: 28, height: 28)
+        .accessibilityHidden(true)
     }
 
     private var permissions: some View {

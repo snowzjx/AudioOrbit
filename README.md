@@ -1,97 +1,51 @@
 # AudioOrbit
 
-AudioOrbit is a native macOS menu-bar app that routes an application's audio to the output mapped to the display containing that application's selected window. Different applications can follow different displays and play through different physical outputs at the same time—without changing the system default output device.
+AudioOrbit is a native macOS menu-bar app that sends each application's audio to the output mapped to the display containing its window. Multiple applications can play through different physical outputs simultaneously without changing the system default output.
 
-## Current status
+## Key features
 
-The repository contains an integrated, hardware-tested MVP with first-launch guidance, privacy-safe diagnostics, automated CI, and release tooling. The remaining release gates are the hardware endurance matrix, measured performance budgets, VoiceOver validation, and credentialed Developer ID/notarization testing.
-
-Implemented today:
-
-- Per-application Core Audio process taps with safe suppression of the original output.
-- Independent routes for multiple audio-producing applications.
-- Display-to-output mappings persisted by stable display UUID and Core Audio device UID.
-- Automatic window following with 500 ms dwell and display-boundary hysteresis.
-- Conservative helper-process correlation, including Safari's `Safari Graphics and Media` process.
-- Full-screen transition retention for established Safari and native-app routes.
-- Live destination switching with fade-out, fresh buffer priming, and fade-in.
-- Mismatched sample-rate support and bounded adaptive correction for independently clocked devices.
-- Safe pass-through and same-UID recovery when a normal mapped output disconnects.
-- Remembered application routes that remain until the user deletes them.
-- Physical-device volume sliders where Core Audio exposes a writable volume control.
-- Headphone Override for sending all managed audio to one selected connected output, with clean restoration of display routing on disconnect.
-- A native AppKit status item, SwiftUI popover and Settings scene, including application icons, right-click Enable/Disable and a temporary Dock icon while Settings is open.
-- A layered Icon Composer app icon with native Liquid Glass, Dark and Mono appearances, plus Xcode-generated compatibility artwork for macOS 14.2.
-- A one-time welcome window that explains display mapping and both permissions without enabling routing prematurely.
-- A previewable, exportable support report with anonymous output/route labels, resource measurements, audio-health counters and bounded coded events.
-- Unified logging and Instruments signposts for hardware refreshes and route transitions.
+- Automatic display-to-audio-output routing for multiple applications.
+- Stable Safari and helper-process routing, including full-screen transitions and playback-window anchoring.
+- Smooth live destination switching with sample-rate conversion and adaptive clock correction.
+- Persistent display mappings, remembered routes, and application-level ignore rules.
+- Headphone Override sends all managed audio to one selected device and restores display routing when it disconnects.
+- Physical-device volume controls when the output exposes a writable Core Audio volume control.
+- Safe pass-through when permission, capture, or destination failures occur.
+- Private by design: audio stays in bounded volatile memory and is never stored, transmitted, transcribed, or analyzed.
 
 ## Requirements
 
 - macOS 14.2 or later.
-- Xcode 26, or another Xcode containing the macOS 14.2+ Core Audio process-tap SDK.
-- A signed build so macOS can persist privacy permissions reliably.
+- Accessibility permission for window location and focus.
+- System Audio Recording permission when the first route starts.
 
 The production bundle identifier is `me.snowzjx.AudioOrbit`.
 
+## Use AudioOrbit
+
+1. Download the latest notarized ZIP from [GitHub Releases](https://github.com/snowzjx/AudioOrbit/releases), move AudioOrbit to Applications, and open it.
+2. Open **Settings → Displays** and map each display to a physical audio output. Choose **Use System Default** to leave a display unmanaged.
+3. Grant and recheck Accessibility permission in **Settings → Permissions**.
+4. Enable AudioOrbit from the menu-bar popover and start playback.
+
+Moving the selected window to another mapped display moves its audio after a short stable delay. Removing a route permanently ignores that application until **Settings → General → Allow Again** is selected.
+
+Safari media routes stay anchored to the window where playback began, so using another Safari window does not move established audio. Safari does not expose reliable public per-tab audio ownership, so simultaneous tabs or background autoplay can remain ambiguous.
+
 ## Build and test
 
-Open `AudioOrbit.xcodeproj`, select the **AudioOrbit** scheme, and run the app. AudioOrbit normally appears only in the menu bar; its Dock icon is shown while the Settings window is open.
-
-Run the automated suite from Xcode, or from Terminal:
+Open `AudioOrbit.xcodeproj` and run the **AudioOrbit** scheme with Xcode 26 or a compatible Xcode containing the macOS Core Audio process-tap SDK.
 
 ```sh
 xcodebuild -project AudioOrbit.xcodeproj -scheme AudioOrbit test
 ```
 
-The suite currently contains 50 tests covering the real-time bridge, sample-rate conversion and drift correction, buffer health, display/window policy, route recovery and permission-revocation policy, concurrent route admission, diagnostics redaction, onboarding persistence, configuration migration, Core Audio error formatting, and helper-process association.
-
-## Using AudioOrbit
-
-1. Open **Settings…** from the menu-bar popover.
-2. In **Displays**, choose a physical audio output for every display AudioOrbit should manage. Choose **Use System Default** to leave applications on that display untouched.
-3. In **Permissions**, grant and recheck Accessibility. The first real route may also trigger macOS System Audio Recording permission.
-4. Press **Enable** in the menu-bar popover, then play audio in an application with a visible window.
-5. Move the window to another mapped display. After a short stable delay, its audio follows the new display.
-
-Left-click the status item to open the popover. Right-click it for quick Enable/Disable and Quit actions. Route cards show the application, display and destination; the trash button removes both the live route and its remembered entry.
-
-### Output volume
-
-The popover shows one slider per physical output that advertises a public writable Core Audio volume scalar. HDMI, DisplayPort and hardware-managed outputs commonly expose a fixed level, so they intentionally have no slider.
-
-### Headphone Override
-
-In **Settings → General**, select a headphone output and enable **Headphone Override**. While that exact output UID is connected, all managed applications use it. Disconnecting the output cleanly restores normal display routing and clears override status; the preference stays armed so the same output can take over again when it reconnects.
-
-## Routing and safety
-
-Each route owns a private process tap, aggregate input, preallocated SPSC bridge, adaptive resampler and AUHAL renderer bound to its selected physical output. Capture and rendering are isolated so one route's failure does not intentionally stop healthy routes.
-
-AudioOrbit prefers audible pass-through over silence. A failed setup tears down the tap. A disappearing mapped destination releases the affected tap so normal macOS playback resumes, while Headphone Override disconnect is treated as a clean policy handoff back to display routing.
-
-Audio frames exist only in bounded volatile memory while being routed. AudioOrbit does not store, transmit, transcribe, fingerprint or analyze audio content, and it does not read window titles or screen pixels.
-
-## Development signing
-
-Debug builds use a project-specific local designated requirement so Accessibility approval survives normal Xcode rebuilds when no Apple Development certificate is installed. This is development-only; Developer ID signing, notarization and distribution validation remain release work.
-
-After replacing an older ad-hoc build, remove the old AudioOrbit entry from **System Settings → Privacy & Security → Accessibility** once, then grant the current build access.
-
-## Release preparation
-
-- `scripts/build-release.sh` creates and verifies a Developer ID archive and ZIP when `AUDIOORBIT_TEAM_ID` is set.
-- `scripts/notarize-release.sh` submits, staples and validates the ZIP using an `AUDIOORBIT_NOTARY_PROFILE` Keychain profile.
-- `scripts/profile-running-app.sh` records a Time Profiler trace from a running test scenario.
-- `docs/RELEASE_CHECKLIST.md` is the hardware, recovery, accessibility and distribution gate.
-- `docs/PERFORMANCE_BUDGETS.md` defines the initial latency, audio-health and resource budgets.
-- `docs/DISTRIBUTION.md` contains the Developer ID, Keychain, GitHub Secrets, notarization and tag-release walkthrough.
+The automated suite contains 55 tests.
 
 ## Documentation
 
-- [Project specification](PROJECT_SPEC.md)
-- [Audio routing architecture decision](docs/ADR-001-audio-routing-engine.md)
-- [Known limitations](KNOWN_LIMITATIONS.md)
+- [Product specification](PROJECT_SPEC.md)
+- [Audio routing architecture](docs/ADR-001-audio-routing-engine.md)
 - [Release checklist](docs/RELEASE_CHECKLIST.md)
 - [Performance budgets](docs/PERFORMANCE_BUDGETS.md)
 - [Developer ID and GitHub distribution](docs/DISTRIBUTION.md)

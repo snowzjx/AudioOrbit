@@ -50,9 +50,11 @@ AudioOrbit reconciles window state every 250 ms while enabled and audio-process 
 
 The visible application and audio-producing process may differ. Association is allowed through the same process, a regular parent chain, a unique exact bundle match, or the validated system WebKit media service's client-qualified LaunchServices identity. Ambiguous helpers remain pass-through. This supports Safari while avoiding arbitrary name-prefix capture.
 
+When the audio source is a helper process, its first selected owner window becomes a playback-window anchor. Public Core Graphics window numbers provide stable identity where Accessibility lacks one. Later focus changes within the owner application do not replace the anchor; moving the anchored window still follows display routing, while a temporarily missing anchor retains its last committed output. A confirmed stopped-to-running output transition releases the anchor so a reused Safari helper can attach a new playback session to a newly selected window. This reduces false Safari route changes without claiming per-tab audio identity or allowing multiple windows from one helper route to target different outputs.
+
 ## Persistence and policy overlays
 
-Display mappings persist stable display UUID → device UID intent. Remembered application routes persist by bundle identifier, never PID. Runtime Core Audio IDs, taps and buffers are never persisted.
+Display mappings persist stable display UUID → device UID intent. Remembered application routes and ignored applications persist by the visible application's bundle identifier, never PID or helper-process identity. Removing a route replaces remembered intent with an ignore rule; the rule excludes that application and its associated audio helpers from route creation, restoration and Headphone Override until the user explicitly allows it again. Runtime Core Audio IDs, taps and buffers are never persisted.
 
 Headphone Override is a temporary policy overlay. It switches live routes to one explicitly selected connected device UID but does not overwrite their remembered display destinations. Disconnect tears down override routes first and immediately recalculates normal display routing; reconnect may reactivate the armed preference.
 
@@ -76,7 +78,7 @@ Headphone Override is a temporary policy overlay. It switches live routes to one
 - [x] Adaptive correction removed the observed sustained buffer-pressure failure on the tested external device.
 - [x] Music, Safari helper audio and Safari full-screen transitions have been exercised successfully.
 - [x] Normal output hot-plug recovery and Headphone Override connect/disconnect have been exercised.
-- [x] Fifty automated tests cover bridge, health, route recovery, permission revocation, diagnostics redaction, onboarding persistence, window policy, configuration migration, association and admission behavior.
+- [x] Fifty-five automated tests cover bridge, health, route recovery, permission revocation, diagnostics redaction, onboarding persistence, window and playback-affinity policy, configuration migration, persistent ignore policy, association and admission behavior.
 - [x] Privacy-safe support reports expose resource, latency and buffer-health evidence without application, device, display, PID, UID, window-title or path identity.
 - [ ] Complete a continuous 30-minute multi-rate run after the latest correction changes.
 - [ ] Complete a one-hour four-route CPU/memory/wakeup/deadline run.

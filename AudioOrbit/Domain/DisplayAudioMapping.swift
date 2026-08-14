@@ -67,13 +67,21 @@ struct CachedApplicationRoute: Codable, Equatable, Identifiable, Sendable {
     var lastDeviceName: String
 }
 
+struct IgnoredApplication: Codable, Equatable, Identifiable, Sendable {
+    var id: String { applicationBundleIdentifier }
+
+    let applicationBundleIdentifier: String
+    var applicationName: String
+}
+
 struct PersistedConfiguration: Codable, Equatable, Sendable {
-    static let currentSchemaVersion = 2
+    static let currentSchemaVersion = 3
 
     var schemaVersion: Int
     var mappings: [DisplayAudioMapping]
     var routingEnabled: Bool
     var cachedRoutes: [CachedApplicationRoute]
+    var ignoredApplications: [IgnoredApplication]
     var headphoneOverrideEnabled: Bool
     var headphoneOverrideDeviceUID: String?
 
@@ -82,6 +90,7 @@ struct PersistedConfiguration: Codable, Equatable, Sendable {
         mappings: [DisplayAudioMapping],
         routingEnabled: Bool,
         cachedRoutes: [CachedApplicationRoute] = [],
+        ignoredApplications: [IgnoredApplication] = [],
         headphoneOverrideEnabled: Bool = false,
         headphoneOverrideDeviceUID: String? = nil
     ) {
@@ -89,6 +98,7 @@ struct PersistedConfiguration: Codable, Equatable, Sendable {
         self.mappings = mappings
         self.routingEnabled = routingEnabled
         self.cachedRoutes = cachedRoutes
+        self.ignoredApplications = ignoredApplications
         self.headphoneOverrideEnabled = headphoneOverrideEnabled
         self.headphoneOverrideDeviceUID = headphoneOverrideDeviceUID
     }
@@ -98,6 +108,7 @@ struct PersistedConfiguration: Codable, Equatable, Sendable {
         case mappings
         case routingEnabled
         case cachedRoutes
+        case ignoredApplications
         case headphoneOverrideEnabled
         case headphoneOverrideDeviceUID
     }
@@ -110,6 +121,10 @@ struct PersistedConfiguration: Codable, Equatable, Sendable {
         cachedRoutes = try container.decodeIfPresent(
             [CachedApplicationRoute].self,
             forKey: .cachedRoutes
+        ) ?? []
+        ignoredApplications = try container.decodeIfPresent(
+            [IgnoredApplication].self,
+            forKey: .ignoredApplications
         ) ?? []
         headphoneOverrideEnabled = try container.decodeIfPresent(
             Bool.self,
@@ -126,6 +141,7 @@ struct PersistedConfiguration: Codable, Equatable, Sendable {
         mappings: [],
         routingEnabled: false,
         cachedRoutes: [],
+        ignoredApplications: [],
         headphoneOverrideEnabled: false,
         headphoneOverrideDeviceUID: nil
     )
@@ -138,6 +154,14 @@ struct PersistedConfiguration: Codable, Equatable, Sendable {
                 !$0.applicationBundleIdentifier.isEmpty && !$0.lastDeviceUID.isEmpty
             }
             && Set(cachedRoutes.map(\.applicationBundleIdentifier)).count == cachedRoutes.count
+            && ignoredApplications.allSatisfy {
+                !$0.applicationBundleIdentifier.isEmpty && !$0.applicationName.isEmpty
+            }
+            && Set(ignoredApplications.map(\.applicationBundleIdentifier)).count
+                == ignoredApplications.count
+            && Set(cachedRoutes.map(\.applicationBundleIdentifier)).isDisjoint(
+                with: Set(ignoredApplications.map(\.applicationBundleIdentifier))
+            )
             && (!headphoneOverrideEnabled
                 || headphoneOverrideDeviceUID?.isEmpty == false)
     }
@@ -173,7 +197,7 @@ struct MappingStore: Sendable {
         do {
             let data = try Data(contentsOf: fileURL)
             var decoded = try JSONDecoder().decode(PersistedConfiguration.self, from: data)
-            if decoded.schemaVersion == 1 {
+            if decoded.schemaVersion == 1 || decoded.schemaVersion == 2 {
                 decoded.schemaVersion = PersistedConfiguration.currentSchemaVersion
             }
             guard decoded.isValid else {

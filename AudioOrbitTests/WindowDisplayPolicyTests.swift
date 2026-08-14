@@ -42,6 +42,84 @@ final class WindowDisplayPolicyTests: XCTestCase {
         XCTAssertNil(WindowDisplayPolicy.selectWindow(from: candidates, displays: displays))
     }
 
+    func testPlaybackWindowAnchorBeatsAnotherFocusedWindow() throws {
+        let displays = [display(
+            "00000000-0000-0000-0000-000000000001",
+            frame: .init(x: 0, y: 0, width: 2_000, height: 800)
+        )]
+        let candidates = [
+            window(
+                "playing",
+                frame: .init(x: 0, y: 0, width: 800, height: 700)
+            ),
+            window(
+                "focused",
+                frame: .init(x: 1_000, y: 0, width: 800, height: 700),
+                isFocused: true
+            ),
+        ]
+
+        let selection = try XCTUnwrap(WindowDisplayPolicy.selectWindow(
+            from: candidates,
+            displays: displays,
+            preferredWindowIdentifier: "playing"
+        ))
+
+        XCTAssertEqual(selection.window.stableIdentifier, "playing")
+        XCTAssertEqual(selection.source, .routeAnchor)
+    }
+
+    func testMissingPlaybackWindowAnchorDoesNotFallBackToFocusedWindow() {
+        let displays = [display(
+            "00000000-0000-0000-0000-000000000001",
+            frame: .init(x: 0, y: 0, width: 1_000, height: 800)
+        )]
+
+        XCTAssertNil(WindowDisplayPolicy.selectWindow(
+            from: [window(
+                "focused",
+                frame: .init(x: 0, y: 0, width: 800, height: 700),
+                isFocused: true
+            )],
+            displays: displays,
+            preferredWindowIdentifier: "playing"
+        ))
+    }
+
+    func testOnlyHelperAssociationsPinTheirInitialWindow() {
+        XCTAssertFalse(WindowRouteAffinityPolicy.pinsInitialWindow(for: .sameProcess))
+        XCTAssertTrue(WindowRouteAffinityPolicy.pinsInitialWindow(for: .parentApplication))
+        XCTAssertTrue(WindowRouteAffinityPolicy.pinsInitialWindow(for: .matchingBundle))
+        XCTAssertTrue(WindowRouteAffinityPolicy.pinsInitialWindow(for: .systemWebKitClient))
+        XCTAssertEqual(WindowRouteAffinityPolicy.routeAnchor(
+            existing: nil,
+            selected: "playing",
+            associationReason: .systemWebKitClient
+        ), "playing")
+        XCTAssertEqual(WindowRouteAffinityPolicy.routeAnchor(
+            existing: "playing",
+            selected: "focused-elsewhere",
+            associationReason: .systemWebKitClient
+        ), "playing")
+        XCTAssertNil(WindowRouteAffinityPolicy.routeAnchor(
+            existing: "playing",
+            selected: "focused-elsewhere",
+            associationReason: .sameProcess
+        ))
+        XCTAssertFalse(WindowRouteAffinityPolicy.beginsNewPlaybackSession(
+            wasRunningOutput: nil,
+            isRunningOutput: true
+        ))
+        XCTAssertFalse(WindowRouteAffinityPolicy.beginsNewPlaybackSession(
+            wasRunningOutput: true,
+            isRunningOutput: true
+        ))
+        XCTAssertTrue(WindowRouteAffinityPolicy.beginsNewPlaybackSession(
+            wasRunningOutput: false,
+            isRunningOutput: true
+        ))
+    }
+
     func testLargestIntersectionWorksWithNegativeAndVerticallyStackedCoordinates() throws {
         let left = display("00000000-0000-0000-0000-000000000001", name: "Left", frame: .init(x: -1_000, y: 0, width: 1_000, height: 800))
         let main = display("00000000-0000-0000-0000-000000000002", name: "Main", frame: .init(x: 0, y: 0, width: 1_000, height: 800))

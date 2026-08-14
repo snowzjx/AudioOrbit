@@ -32,6 +32,31 @@ final class ProcessWindowAssociationTests: XCTestCase {
         XCTAssertEqual(association.audioProcess.pid, 220)
     }
 
+    func testIgnoredSafariAlsoExcludesItsMediaHelper() throws {
+        let source = audioProcess(
+            pid: 220,
+            bundle: "com.apple.WebKit.GPU",
+            name: "Safari Graphics and Media"
+        )
+        let safari = application(pid: 200, bundle: "com.apple.Safari", name: "Safari")
+        let association = ProcessWindowAssociation(
+            audioProcess: source,
+            windowOwner: safari,
+            reason: .parentApplication
+        )
+
+        XCTAssertFalse(AutomaticRouteEligibilityPolicy.shouldManage(
+            source: source,
+            association: association,
+            ignoredBundleIdentifiers: ["com.apple.Safari"]
+        ))
+        XCTAssertTrue(AutomaticRouteEligibilityPolicy.shouldManage(
+            source: source,
+            association: association,
+            ignoredBundleIdentifiers: []
+        ))
+    }
+
     func testLaunchdOwnedSystemSafariMediaHelperUsesSafariWindow() throws {
         let safari = application(pid: 200, bundle: "com.apple.Safari", name: "Safari")
         let association = try XCTUnwrap(ProcessWindowAssociationPolicy.resolve(

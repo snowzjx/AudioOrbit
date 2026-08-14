@@ -8,6 +8,27 @@ struct AutomaticRouteTarget: Equatable, Sendable {
     let destinationDeviceUID: String
 }
 
+enum AutomaticRouteEligibilityPolicy {
+    static func applicationBundleIdentifier(
+        source: AudioProcessSnapshot,
+        association: ProcessWindowAssociation?
+    ) -> String? {
+        association?.windowOwner.bundleIdentifier ?? source.bundleIdentifier
+    }
+
+    static func shouldManage(
+        source: AudioProcessSnapshot,
+        association: ProcessWindowAssociation?,
+        ignoredBundleIdentifiers: Set<String>
+    ) -> Bool {
+        guard let bundleIdentifier = applicationBundleIdentifier(
+            source: source,
+            association: association
+        ) else { return true }
+        return !ignoredBundleIdentifiers.contains(bundleIdentifier)
+    }
+}
+
 enum AutomaticRouteTargetPolicy {
     static func resolve(
         source: AudioProcessSnapshot,

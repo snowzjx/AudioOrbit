@@ -21,7 +21,8 @@ struct AccessibilityWindowDiscovery {
         windowOwner: WindowOwnerSnapshot,
         associationReason: ProcessWindowAssociationReason,
         displays: [DisplaySnapshot],
-        committedDisplayUUID: UUID? = nil
+        committedDisplayUUID: UUID? = nil,
+        preferredWindowIdentifier: String? = nil
     ) -> WindowDisplayEvidence {
         let application = AXUIElementCreateApplication(windowOwner.pid)
         let focusedWindow = elementAttribute(application, kAXFocusedWindowAttribute as CFString)
@@ -48,27 +49,38 @@ struct AccessibilityWindowDiscovery {
             kAXWindowsAttribute as CFString
         ) ?? []
 
+        // Helper processes such as Safari's media service do not expose the
+        // browser window that initiated playback. Match the owning app's AX
+        // windows to public Core Graphics window numbers so the chosen window
+        // keeps a stable identity when focus moves to another browser window.
+        var surfaceCandidates = WindowRouteAffinityPolicy.pinsInitialWindow(
+            for: associationReason
+        ) ? visibleSurfaceCandidates(processPID: windowOwner.pid) : []
+
         let accessibilityCandidates = windows.enumerated().compactMap { index, window in
             candidate(
                 from: window,
                 processPID: windowOwner.pid,
                 index: index,
                 isFocused: focusedWindow.map { CFEqual($0, window) } ?? false,
-                isMain: mainWindow.map { CFEqual($0, window) } ?? false
+                isMain: mainWindow.map { CFEqual($0, window) } ?? false,
+                visibleSurfaces: surfaceCandidates
             )
         }
         let candidates: [WindowCandidateSnapshot]
         if WindowDisplayPolicy.selectWindow(
             from: accessibilityCandidates,
-            displays: displays
+            displays: displays,
+            preferredWindowIdentifier: preferredWindowIdentifier
         ) == nil {
             // Safari's HTML video fullscreen surface is visible at Core
             // Graphics layer 0 but is not consistently exposed as an
             // AXStandardWindow. Use only same-PID, on-screen application
             // surfaces and let the existing largest-visible policy select it.
-            candidates = accessibilityCandidates + visibleSurfaceCandidates(
-                processPID: windowOwner.pid
-            )
+            if surfaceCandidates.isEmpty {
+                surfaceCandidates = visibleSurfaceCandidates(processPID: windowOwner.pid)
+            }
+            candidates = accessibilityCandidates + surfaceCandidates
         } else {
             candidates = accessibilityCandidates
         }
@@ -78,7 +90,8 @@ struct AccessibilityWindowDiscovery {
 
         guard let selection = WindowDisplayPolicy.selectWindow(
             from: candidates,
-            displays: displays
+            displays: displays,
+            preferredWindowIdentifier: preferredWindowIdentifier
         ) else {
             return WindowDisplayEvidence(
                 sourcePID: process.pid,
@@ -162,7 +175,8 @@ struct AccessibilityWindowDiscovery {
         processPID: pid_t,
         index: Int,
         isFocused: Bool,
-        isMain: Bool
+        isMain: Bool,
+        visibleSurfaces: [WindowCandidateSnapshot]
     ) -> WindowCandidateSnapshot? {
         guard let position = pointAttribute(window, kAXPositionAttribute as CFString),
               let size = sizeAttribute(window, kAXSizeAttribute as CFString) else { return nil }
@@ -170,17 +184,32 @@ struct AccessibilityWindowDiscovery {
         let subrole = stringAttribute(window, kAXSubroleAttribute as CFString)
         let isNormalWindow = role == (kAXWindowRole as String)
             && (subrole == nil || subrole == (kAXStandardWindowSubrole as String))
-        let identifier = stringAttribute(window, kAXIdentifierAttribute as CFString)
-            ?? "\(processPID):\(index)"
+        let frame = CGRect(origin: position, size: size)
+        let matchingSurfaceIdentifiers = visibleSurfaces.compactMap { surface in
+            framesApproximatelyMatch(frame, surface.frame) ? surface.stableIdentifier : nil
+        }
+        let identifier = (matchingSurfaceIdentifiers.count == 1
+            ? matchingSurfaceIdentifiers[0]
+            : nil)
+            ?? stringAttribute(window, kAXIdentifierAttribute as CFString)
+            ?? "ax:\(processPID):\(index)"
         return WindowCandidateSnapshot(
             stableIdentifier: identifier,
-            frame: CGRect(origin: position, size: size),
+            frame: frame,
             isFocused: isFocused,
             isMain: isMain,
             isMinimized: boolAttribute(window, kAXMinimizedAttribute as CFString) ?? false,
             isNormalWindow: isNormalWindow,
             frontToBackIndex: index
         )
+    }
+
+    private func framesApproximatelyMatch(_ lhs: CGRect, _ rhs: CGRect) -> Bool {
+        let tolerance: CGFloat = 2
+        return abs(lhs.minX - rhs.minX) <= tolerance
+            && abs(lhs.minY - rhs.minY) <= tolerance
+            && abs(lhs.width - rhs.width) <= tolerance
+            && abs(lhs.height - rhs.height) <= tolerance
     }
 
     private func attribute(_ element: AXUIElement, _ name: CFString) -> CFTypeRef? {

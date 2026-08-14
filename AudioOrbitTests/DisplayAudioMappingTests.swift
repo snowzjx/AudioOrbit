@@ -74,6 +74,12 @@ final class DisplayAudioMappingTests: XCTestCase {
             mappings: [],
             routingEnabled: true,
             cachedRoutes: [remembered],
+            ignoredApplications: [
+                IgnoredApplication(
+                    applicationBundleIdentifier: "com.apple.Music",
+                    applicationName: "Music"
+                ),
+            ],
             headphoneOverrideEnabled: true,
             headphoneOverrideDeviceUID: "headphones-1"
         )
@@ -99,8 +105,28 @@ final class DisplayAudioMappingTests: XCTestCase {
         XCTAssertEqual(configuration.schemaVersion, PersistedConfiguration.currentSchemaVersion)
         XCTAssertTrue(configuration.routingEnabled)
         XCTAssertTrue(configuration.cachedRoutes.isEmpty)
+        XCTAssertTrue(configuration.ignoredApplications.isEmpty)
         XCTAssertFalse(configuration.headphoneOverrideEnabled)
         XCTAssertNil(configuration.headphoneOverrideDeviceUID)
+    }
+
+    func testVersionTwoConfigurationMigratesWithNoIgnoredApplications() throws {
+        let store = try temporaryStore()
+        let json = """
+        {
+          "schemaVersion" : 2,
+          "mappings" : [],
+          "routingEnabled" : true,
+          "cachedRoutes" : [],
+          "headphoneOverrideEnabled" : false
+        }
+        """
+        try Data(json.utf8).write(to: store.fileURL)
+
+        let configuration = store.load().configuration
+
+        XCTAssertEqual(configuration.schemaVersion, PersistedConfiguration.currentSchemaVersion)
+        XCTAssertTrue(configuration.ignoredApplications.isEmpty)
     }
 
     func testBluetoothOutputsAreEligibleForHeadphonePresentation() {
@@ -159,6 +185,17 @@ final class DisplayAudioMappingTests: XCTestCase {
             schemaVersion: 1,
             mappings: [valid, valid],
             routingEnabled: false
+        ).isValid)
+
+        let ignored = IgnoredApplication(
+            applicationBundleIdentifier: "com.apple.Music",
+            applicationName: "Music"
+        )
+        XCTAssertFalse(PersistedConfiguration(
+            schemaVersion: PersistedConfiguration.currentSchemaVersion,
+            mappings: [],
+            routingEnabled: false,
+            ignoredApplications: [ignored, ignored]
         ).isValid)
     }
 

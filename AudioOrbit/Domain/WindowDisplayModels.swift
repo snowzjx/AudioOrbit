@@ -15,6 +15,7 @@ enum WindowSelectionSource: String, Equatable, Sendable {
     case focused = "Focused window"
     case main = "Main window"
     case largestVisible = "Largest visible window"
+    case routeAnchor = "Playback window"
 }
 
 struct WindowCandidateSnapshot: Equatable, Sendable {
@@ -45,7 +46,8 @@ struct WindowDisplayEvidence: Equatable, Sendable {
 enum WindowDisplayPolicy {
     static func selectWindow(
         from candidates: [WindowCandidateSnapshot],
-        displays: [DisplaySnapshot]
+        displays: [DisplaySnapshot],
+        preferredWindowIdentifier: String? = nil
     ) -> (window: WindowCandidateSnapshot, source: WindowSelectionSource)? {
         let eligible = candidates.filter { candidate in
             guard candidate.isNormalWindow,
@@ -53,6 +55,12 @@ enum WindowDisplayPolicy {
                   candidate.frame.width > 0,
                   candidate.frame.height > 0 else { return false }
             return visibleArea(of: candidate.frame, on: displays) > 0
+        }
+
+        if let preferredWindowIdentifier {
+            return eligible.first {
+                $0.stableIdentifier == preferredWindowIdentifier
+            }.map { ($0, .routeAnchor) }
         }
 
         if let focused = eligible.first(where: \.isFocused) {
@@ -112,6 +120,28 @@ enum WindowDisplayPolicy {
         let intersection = lhs.intersection(rhs)
         guard !intersection.isNull, !intersection.isEmpty else { return 0 }
         return intersection.width * intersection.height
+    }
+}
+
+enum WindowRouteAffinityPolicy {
+    static func pinsInitialWindow(for reason: ProcessWindowAssociationReason) -> Bool {
+        reason != .sameProcess
+    }
+
+    static func routeAnchor(
+        existing: String?,
+        selected: String?,
+        associationReason: ProcessWindowAssociationReason
+    ) -> String? {
+        guard pinsInitialWindow(for: associationReason) else { return nil }
+        return existing ?? selected
+    }
+
+    static func beginsNewPlaybackSession(
+        wasRunningOutput: Bool?,
+        isRunningOutput: Bool
+    ) -> Bool {
+        wasRunningOutput == false && isRunningOutput
     }
 }
 

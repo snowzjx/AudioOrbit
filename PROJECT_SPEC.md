@@ -102,6 +102,7 @@ The following are explicitly outside v1:
 - [x] Physical-device volume controls for outputs with a writable public Core Audio scalar.
 - [x] User-selected Headphone Override with automatic display-route restoration on disconnect.
 - [x] Conservative Safari/WebKit helper association and established-route retention through full-screen transitions.
+- [x] Layered Icon Composer app icon with Default, Dark and Mono appearances and generated legacy-macOS artwork.
 
 ### Optional only after required behavior is stable
 
@@ -200,7 +201,7 @@ The names below describe logical responsibilities. Current concrete types includ
 
 - Defines the SwiftUI `App` and `Settings` scene plus an AppKit `NSStatusItem`/`NSPopover` shell for distinct left- and right-click behavior.
 - Owns top-level `AppState` snapshots for UI presentation.
-- Uses `LSUIElement` behavior appropriate for a menu-bar utility; verify whether a Dock icon is needed during onboarding or error recovery.
+- Uses `LSUIElement` behavior at launch, temporarily adopts regular-app activation while the Settings window is open so its app icon appears in the Dock, and returns to accessory activation when that window closes.
 
 ### `PermissionManager`
 
@@ -514,6 +515,7 @@ Raw process selection, buffer counters, manual feasibility controls, and OSStatu
 
 ### Accessibility and polish
 
+- Keep `AppIcon.icon` as the authoritative app-icon source. Artwork is separated into orbit, destination, audio-core and waveform SVG layers so Icon Composer—not flattened source artwork—owns the Liquid Glass material and platform rendering.
 - All icons require labels/tooltips and VoiceOver descriptions.
 - Do not communicate health by color alone.
 - Use localized user-facing strings.

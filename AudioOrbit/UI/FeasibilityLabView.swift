@@ -1,3 +1,4 @@
+import AppKit
 import CoreAudio
 import SwiftUI
 
@@ -24,6 +25,7 @@ struct AudioOrbitSettingsView: View {
             minHeight: 540,
             idealHeight: 600
         )
+        .background(SettingsWindowDockPresence())
     }
 
     private func settingsPage<Content: View>(
@@ -213,5 +215,88 @@ struct AudioOrbitSettingsView: View {
     private func hasListedDevice(for selection: DisplayMappingSelection) -> Bool {
         guard case .device(let uid) = selection else { return false }
         return model.devices.contains { $0.uid == uid }
+    }
+}
+
+private struct SettingsWindowDockPresence: NSViewRepresentable {
+    func makeNSView(context: Context) -> SettingsWindowDockObserverView {
+        SettingsWindowDockObserverView()
+    }
+
+    func updateNSView(
+        _ nsView: SettingsWindowDockObserverView,
+        context: Context
+    ) {}
+
+    static func dismantleNSView(
+        _ nsView: SettingsWindowDockObserverView,
+        coordinator: Void
+    ) {
+        nsView.stopObserving()
+    }
+}
+
+@MainActor
+private final class SettingsWindowDockObserverView: NSView {
+    private weak var observedWindow: NSWindow?
+    private var becameKeyObserver: NSObjectProtocol?
+    private var closeObserver: NSObjectProtocol?
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+
+        guard let window else {
+            if observedWindow != nil {
+                stopObserving()
+                restoreAccessoryMode()
+            }
+            return
+        }
+        guard observedWindow !== window else { return }
+
+        stopObserving()
+        observedWindow = window
+        showDockIcon()
+
+        becameKeyObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.didBecomeKeyNotification,
+            object: window,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.showDockIcon()
+            }
+        }
+
+        closeObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.willCloseNotification,
+            object: window,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.restoreAccessoryMode()
+            }
+        }
+    }
+
+    func stopObserving() {
+        if let becameKeyObserver {
+            NotificationCenter.default.removeObserver(becameKeyObserver)
+        }
+        if let closeObserver {
+            NotificationCenter.default.removeObserver(closeObserver)
+        }
+        becameKeyObserver = nil
+        closeObserver = nil
+        observedWindow = nil
+    }
+
+    private func showDockIcon() {
+        NSApp.setActivationPolicy(.regular)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    private func restoreAccessoryMode() {
+        NSApp.setActivationPolicy(.accessory)
     }
 }

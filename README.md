@@ -20,7 +20,8 @@ Implemented today:
 - Remembered application routes that remain until the user deletes them.
 - Physical-device volume sliders where Core Audio exposes a writable volume control.
 - Headphone Override for sending all managed audio to one selected connected output, with clean restoration of display routing on disconnect.
-- A native AppKit status item, SwiftUI popover and Settings scene, including application icons and right-click Enable/Disable.
+- A native AppKit status item, SwiftUI popover and Settings scene, including application icons, right-click Enable/Disable and a temporary Dock icon while Settings is open.
+- A layered Icon Composer app icon with native Liquid Glass, Dark and Mono appearances, plus Xcode-generated compatibility artwork for macOS 14.2.
 
 ## Requirements
 
@@ -30,7 +31,7 @@ Implemented today:
 
 ## Build and test
 
-Open `AudioOrbit.xcodeproj`, select the **AudioOrbit** scheme, and run the app. AudioOrbit appears in the menu bar rather than the Dock.
+Open `AudioOrbit.xcodeproj`, select the **AudioOrbit** scheme, and run the app. AudioOrbit normally appears only in the menu bar; its Dock icon is shown while the Settings window is open.
 
 Run the automated suite from Xcode, or from Terminal:
 

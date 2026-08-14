@@ -18,6 +18,9 @@ struct AudioOrbitSettingsView: View {
 
             settingsPage { permissions }
                 .tabItem { Label("Permissions", systemImage: "hand.raised") }
+
+            settingsPage { diagnostics }
+                .tabItem { Label("Support", systemImage: "stethoscope") }
         }
         .frame(
             minWidth: 700,
@@ -64,6 +67,7 @@ struct AudioOrbitSettingsView: View {
                                     .tag(DisplayMappingSelection.device(uid: device.uid))
                             }
                         }
+                        .accessibilityHint("Select the output used by applications on \(row.displayName)")
 
                         if !row.isDisplayConnected {
                             Label("This display is not connected. Its mapping is remembered.", systemImage: "info.circle")
@@ -95,6 +99,7 @@ struct AudioOrbitSettingsView: View {
                     )
                 )
                 .disabled(model.headphoneOverrideDeviceUID == nil)
+                .accessibilityHint("Temporarily sends all managed application audio to the selected headphones")
 
                 Picker(
                     "Headphone output",
@@ -110,6 +115,7 @@ struct AudioOrbitSettingsView: View {
                         Text(device.name).tag(Optional(device.uid))
                     }
                 }
+                .accessibilityHint("Choose the output used for Headphone Override")
 
                 Text("When the chosen output is connected, it temporarily overrides every display mapping. Disconnecting it restores normal window-following routes.")
                     .font(.caption)
@@ -170,6 +176,9 @@ struct AudioOrbitSettingsView: View {
                         : "hand.raised.fill"
                 )
                 .foregroundStyle(model.accessibilityGranted ? .green : .orange)
+                .accessibilityValue(
+                    model.accessibilityGranted ? "Granted" : "Not granted"
+                )
 
                 Text("AudioOrbit uses Accessibility only to determine which display contains an application's window. It does not read window titles or screen pixels.")
                     .font(.caption)
@@ -190,6 +199,68 @@ struct AudioOrbitSettingsView: View {
 
                 if let message = model.windowDiscoveryMessage {
                     Text(message)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.top, 4)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var diagnostics: some View {
+        GroupBox("Support report") {
+            VStack(alignment: .leading, spacing: 12) {
+                Label(
+                    "Safe to preview before sharing",
+                    systemImage: "checkmark.shield"
+                )
+                .font(.subheadline.weight(.medium))
+
+                Text("The report includes build, operating-system, resource, route-state and audio-buffer measurements. It excludes audio, application and device identities, display details, window titles, document paths and user file paths.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                HStack {
+                    Button("Generate Preview") {
+                        model.refreshSupportReportPreview()
+                    }
+                    .buttonStyle(.borderedProminent)
+
+                    Button("Save Report…") {
+                        model.exportSupportReport()
+                    }
+                    .disabled(model.supportReportPreview.isEmpty)
+                }
+
+                if model.supportReportPreview.isEmpty {
+                    ContentUnavailableView(
+                        "No Preview Yet",
+                        systemImage: "doc.text.magnifyingglass",
+                        description: Text("Generate a report to inspect exactly what will be saved.")
+                    )
+                    .frame(maxWidth: .infinity, minHeight: 220)
+                } else {
+                    ScrollView([.vertical, .horizontal]) {
+                        Text(model.supportReportPreview)
+                            .font(.system(.caption, design: .monospaced))
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(10)
+                    }
+                        .frame(height: 280)
+                        .accessibilityLabel("Support report preview")
+                        .background(.background, in: RoundedRectangle(cornerRadius: 8))
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 8)
+                                .stroke(.quaternary)
+                        }
+                }
+
+                if let message = model.supportReportExportMessage {
+                    Label(message, systemImage: "checkmark.circle")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -292,11 +363,10 @@ private final class SettingsWindowDockObserverView: NSView {
     }
 
     private func showDockIcon() {
-        NSApp.setActivationPolicy(.regular)
-        NSApp.activate(ignoringOtherApps: true)
+        ApplicationDockPresence.show()
     }
 
     private func restoreAccessoryMode() {
-        NSApp.setActivationPolicy(.accessory)
+        ApplicationDockPresence.hideIfNoOtherUserWindow(excluding: observedWindow)
     }
 }

@@ -44,6 +44,7 @@ struct MenuBarView: View {
                 .frame(width: 34, height: 34)
                 .foregroundStyle(model.automaticRoutingEnabled ? Color.accentColor : .secondary)
                 .glassCard(cornerRadius: 12)
+                .accessibilityHidden(true)
 
             VStack(alignment: .leading, spacing: 2) {
                 Text("AudioOrbit")
@@ -108,11 +109,9 @@ struct MenuBarView: View {
                 HStack(spacing: 6) {
                     Text(route.sourceName)
                         .font(.subheadline.weight(.medium))
-                    if route.isCached {
-                        Text("REMEMBERED")
-                            .font(.system(size: 8, weight: .bold))
-                            .foregroundStyle(.secondary)
-                    }
+                    Text(routeStateLabel(route))
+                        .font(.system(size: 8, weight: .bold))
+                        .foregroundStyle(.secondary)
                 }
                 Text(routeDescription(route))
                     .font(.caption)
@@ -127,7 +126,8 @@ struct MenuBarView: View {
             }
             .buttonStyle(.plain)
             .foregroundStyle(.secondary)
-            .help("Delete this remembered route")
+            .help(route.isCached ? "Delete this remembered route" : "Stop and forget this route")
+            .accessibilityLabel("Delete route for \(route.sourceName)")
         }
         .padding(12)
         .glassCard(cornerRadius: 14)
@@ -156,8 +156,10 @@ struct MenuBarView: View {
                 .padding(2)
                 .background(.regularMaterial, in: Circle())
                 .offset(x: 3, y: 3)
+                .accessibilityHidden(true)
         }
         .frame(width: 34, height: 34)
+        .accessibilityHidden(true)
     }
 
     private func resolvedApplicationIcon(for route: ProbeRouteSnapshot) -> NSImage? {
@@ -201,6 +203,10 @@ struct MenuBarView: View {
                                 }
                             ),
                             in: 0...1
+                        )
+                        .accessibilityLabel("\(device.name) output volume")
+                        .accessibilityValue(
+                            "\(Int((device.volumeScalar ?? 0) * 100)) percent"
                         )
                         Image(systemName: "speaker.wave.3.fill")
                             .foregroundStyle(.secondary)
@@ -262,6 +268,20 @@ struct MenuBarView: View {
         case .waitingForDestination, .failed: .orange
         case .idle: .secondary
         case .starting, .switching, .stopping, .reconnecting: .blue
+        }
+    }
+
+    private func routeStateLabel(_ route: ProbeRouteSnapshot) -> String {
+        if route.isCached { return "REMEMBERED" }
+        switch route.state {
+        case .idle: return "IDLE"
+        case .starting: return "STARTING"
+        case .running: return "ACTIVE"
+        case .switching: return "SWITCHING"
+        case .stopping: return "STOPPING"
+        case .waitingForDestination: return "WAITING"
+        case .reconnecting: return "RECONNECTING"
+        case .failed: return "NEEDS ATTENTION"
         }
     }
 }

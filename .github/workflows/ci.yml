@@ -1,0 +1,20 @@
+name: AudioOrbit CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and test
+        run: >-
+          xcodebuild
+          -project AudioOrbit.xcodeproj
+          -scheme AudioOrbit
+          -configuration Debug
+          -destination 'platform=macOS'
+          -derivedDataPath "$RUNNER_TEMP/AudioOrbitDerivedData"
+          test

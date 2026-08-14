@@ -76,7 +76,8 @@ Headphone Override is a temporary policy overlay. It switches live routes to one
 - [x] Adaptive correction removed the observed sustained buffer-pressure failure on the tested external device.
 - [x] Music, Safari helper audio and Safari full-screen transitions have been exercised successfully.
 - [x] Normal output hot-plug recovery and Headphone Override connect/disconnect have been exercised.
-- [x] Forty-one automated tests cover bridge, health, policy, persistence, migration, association and admission behavior.
+- [x] Fifty automated tests cover bridge, health, route recovery, permission revocation, diagnostics redaction, onboarding persistence, window policy, configuration migration, association and admission behavior.
+- [x] Privacy-safe support reports expose resource, latency and buffer-health evidence without application, device, display, PID, UID, window-title or path identity.
 - [ ] Complete a continuous 30-minute multi-rate run after the latest correction changes.
 - [ ] Complete a one-hour four-route CPU/memory/wakeup/deadline run.
 - [ ] Measure end-to-end wired and Bluetooth latency on the release hardware matrix.

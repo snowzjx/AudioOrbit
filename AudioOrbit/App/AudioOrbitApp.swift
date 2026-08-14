@@ -18,9 +18,11 @@ struct AudioOrbitApp: App {
 final class AudioOrbitAppDelegate: NSObject, NSApplicationDelegate {
     let model: AppModel
     private var statusItemController: AudioOrbitStatusItemController?
+    private var onboardingWindowController: OnboardingWindowController?
+    private let isRunningTests: Bool
 
     override init() {
-        let isRunningTests = ProcessInfo.processInfo.environment[
+        isRunningTests = ProcessInfo.processInfo.environment[
             "XCTestConfigurationFilePath"
         ] != nil
         if isRunningTests {
@@ -41,6 +43,11 @@ final class AudioOrbitAppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         guard statusItemController == nil else { return }
         statusItemController = AudioOrbitStatusItemController(model: model)
+        if !isRunningTests, !model.hasCompletedOnboarding {
+            let controller = OnboardingWindowController(model: model)
+            onboardingWindowController = controller
+            controller.present()
+        }
     }
 }
 
@@ -67,6 +74,10 @@ private final class AudioOrbitStatusItemController: NSObject {
             button.action = #selector(statusItemClicked(_:))
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
             button.toolTip = "AudioOrbit — right-click to enable or disable"
+            button.setAccessibilityLabel("AudioOrbit")
+            button.setAccessibilityHelp(
+                "Left-click for routes and output volume. Right-click to enable, disable, or quit."
+            )
         }
         updateIcon()
         modelObservation = model.objectWillChange.sink { [weak self] _ in
@@ -129,5 +140,7 @@ private final class AudioOrbitStatusItemController: NSObject {
             accessibilityDescription: "AudioOrbit"
         )
         button.image?.isTemplate = true
+        let state = model.automaticRoutingEnabled ? "enabled" : "disabled"
+        button.setAccessibilityValue("AudioOrbit is \(state)")
     }
 }

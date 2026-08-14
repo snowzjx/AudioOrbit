@@ -2,6 +2,8 @@
 
 AudioOrbit is an integrated MVP under product and release hardening. The following limitations are current and intentional unless noted otherwise.
 
+Only one ordinary AudioOrbit instance is allowed at a time so two copies cannot compete for the same process taps. Quit an older Debug build before launching a newly built copy.
+
 ## Routing model
 
 - Routing is per audio-producing process/application, not per window, tab, document or individual stream. Multiple windows owned by one process share one audio route.
@@ -32,8 +34,8 @@ AudioOrbit is an integrated MVP under product and release hardening. The followi
 
 ## Product and release work
 
-- Dedicated first-run onboarding, a test tone, Launch at Login and per-application exclude/pass-through rules are not implemented yet.
-- User-facing support-report export, structured release diagnostics and a completed VoiceOver review are not implemented yet. Raw feasibility counters are deliberately absent from the end-user UI.
+- The first-run welcome flow is implemented, but the native System Audio Recording prompt is intentionally deferred until the first real route. A standalone test tone, Launch at Login and per-application exclude/pass-through rules are not implemented yet.
+- Privacy-safe support-report preview/export, coded unified logs and performance signposts are implemented. A completed hands-on VoiceOver review remains a release gate; raw feasibility controls remain absent from the end-user UI.
 - Debug signing is designed for local TCC continuity only. Developer ID signing, hardened-runtime distribution behavior, notarization, updates and permission persistence across shipped upgrades still require validation.
 - Permission revocation, force quit, injected crash, sleep/wake, fast user switching and the full minimum/latest-macOS hardware matrix remain release gates.
 

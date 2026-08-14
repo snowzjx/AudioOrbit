@@ -1,6 +1,7 @@
 import AppKit
 import CoreAudio
 import Foundation
+import UniformTypeIdentifiers
 
 @MainActor
 final class AppModel: ObservableObject {
@@ -21,6 +22,9 @@ final class AppModel: ObservableObject {
     @Published private(set) var headphoneOverrideEnabled = false
     @Published private(set) var headphoneOverrideDeviceUID: String?
     @Published private(set) var lastError: String?
+    @Published private(set) var supportReportPreview = ""
+    @Published private(set) var supportReportExportMessage: String?
+    @Published private(set) var hasCompletedOnboarding: Bool
 
     private final class RouteSession {
         let id = UUID()
@@ -38,6 +42,7 @@ final class AppModel: ObservableObject {
         var state: TapProbeState = .starting
         var metrics = TapProbeMetrics()
         var health = AudioRouteHealth()
+        var lastReportedHealthLevel: AudioRouteHealthLevel = .observing
         var notice: String?
         var error: String?
         var healthAnalyzer = AudioHealthAnalyzer()
@@ -91,6 +96,9 @@ final class AppModel: ObservableObject {
     private let processWindowResolver = ProcessWindowAssociationResolver()
     private let volumeController = AudioDeviceVolumeController()
     private let mappingStore: MappingStore
+    private let diagnostics: DiagnosticsRecorder
+    private let onboardingStore: OnboardingStateStore
+    private let launchDate = Date()
     private var sessions: [UUID: RouteSession] = [:]
     private var routeOrder: [UUID] = []
     private var hardwareRefreshTask: Task<Void, Never>?
@@ -167,9 +175,14 @@ final class AppModel: ObservableObject {
 
     init(
         mappingStore: MappingStore = MappingStore(),
-        startsServices: Bool = true
+        startsServices: Bool = true,
+        diagnostics: DiagnosticsRecorder = .shared,
+        onboardingStore: OnboardingStateStore = OnboardingStateStore()
     ) {
         self.mappingStore = mappingStore
+        self.diagnostics = diagnostics
+        self.onboardingStore = onboardingStore
+        hasCompletedOnboarding = onboardingStore.isCompleted
         let loadedConfiguration = mappingStore.load()
         mappings = loadedConfiguration.configuration.mappings
         automaticRoutingEnabled = loadedConfiguration.configuration.routingEnabled
@@ -179,7 +192,13 @@ final class AppModel: ObservableObject {
         publishRoutes()
         if let recoveryNotice = loadedConfiguration.recoveryNotice {
             lastError = recoveryNotice
+            diagnostics.record(
+                "configuration-recovered",
+                category: "persistence",
+                level: .warning
+            )
         }
+        diagnostics.record("launch", category: "application")
         guard startsServices else { return }
         deviceMonitor.onChange = { [weak self] in
             self?.scheduleHardwareReconciliation()
@@ -205,8 +224,46 @@ final class AppModel: ObservableObject {
 
     func refresh() async {
         guard !isAddingRoute, !hasControlPlaneTransition else { return }
+        diagnostics.markRefresh()
         await reconcileAudioHardware(clearErrorOnSuccess: true)
         await refreshWindowEvidence()
+    }
+
+    func refreshSupportReportPreview() {
+        supportReportPreview = makeSupportReport()
+        supportReportExportMessage = nil
+        diagnostics.record("preview-generated", category: "diagnostics")
+    }
+
+    func completeOnboarding() {
+        onboardingStore.setCompleted(true)
+        hasCompletedOnboarding = true
+        diagnostics.record("completed", category: "onboarding")
+    }
+
+    func exportSupportReport() {
+        let report = makeSupportReport()
+        supportReportPreview = report
+        let panel = NSSavePanel()
+        panel.title = "Save AudioOrbit Support Report"
+        panel.nameFieldStringValue = "AudioOrbit-Support-Report.txt"
+        panel.allowedContentTypes = [.plainText]
+        panel.canCreateDirectories = true
+        panel.begin { [weak self] response in
+            guard response == .OK, let url = panel.url else { return }
+            do {
+                try report.write(to: url, atomically: true, encoding: .utf8)
+                self?.supportReportExportMessage = "Support report saved."
+                self?.diagnostics.record("export-succeeded", category: "diagnostics")
+            } catch {
+                self?.supportReportExportMessage = "The support report could not be saved."
+                self?.diagnostics.record(
+                    "export-failed",
+                    category: "diagnostics",
+                    level: .error
+                )
+            }
+        }
     }
 
     func requestAccessibilityAccess() async {
@@ -339,12 +396,14 @@ final class AppModel: ObservableObject {
                 return
             }
             automaticRoutingEnabled = true
+            diagnostics.record("enabled", category: "routing")
             automaticRoutingMessage = "Playing applications will follow their windows after a short stable delay."
             persistConfiguration()
             ensureWindowObservation()
             await refreshAutomaticWindowEvidence()
         } else {
             automaticRoutingEnabled = false
+            diagnostics.record("disabled", category: "routing")
             automaticRoutingMessage = "Follow Window is off. Normal macOS playback is used."
             cancelAutomaticDecisions()
             persistConfiguration()
@@ -358,29 +417,39 @@ final class AppModel: ObservableObject {
 
     func recheckAccessibilityAccess() async {
         accessibilityGranted = AccessibilityPermission.isGranted
-        if accessibilityGranted {
+        let permissionAction = PermissionRoutingPolicy.action(
+            accessibilityGranted: accessibilityGranted,
+            automaticRoutingEnabled: automaticRoutingEnabled,
+            hasConfiguredHeadphoneOverride: headphoneOverrideEnabled
+                && headphoneOverrideDeviceUID != nil
+        )
+        switch permissionAction {
+        case .keepCurrentState where accessibilityGranted:
             windowDiscoveryMessage = nil
             ensureWindowObservation()
             await refreshWindowEvidence()
-        } else {
+        case .keepCurrentState:
             windowEvidence = nil
-            if automaticRoutingEnabled
-                && headphoneOverrideEnabled
-                && headphoneOverrideDeviceUID != nil {
-                ensureWindowObservation()
-                await refreshAutomaticWindowEvidence()
-            } else if automaticRoutingEnabled {
-                windowObservationTask?.cancel()
-                windowObservationTask = nil
-                automaticRoutingEnabled = false
-                automaticRoutingMessage = "Accessibility permission is required. Automatic routing was stopped and normal playback was restored."
-                cancelAutomaticDecisions()
-                persistConfiguration()
-                await stopAllAutomaticRoutes()
-            } else {
-                windowObservationTask?.cancel()
-                windowObservationTask = nil
-            }
+            windowObservationTask?.cancel()
+            windowObservationTask = nil
+        case .continueHeadphoneOverride:
+            windowEvidence = nil
+            ensureWindowObservation()
+            await refreshAutomaticWindowEvidence()
+        case .stopAndRestorePassThrough:
+            windowEvidence = nil
+            windowObservationTask?.cancel()
+            windowObservationTask = nil
+            automaticRoutingEnabled = false
+            automaticRoutingMessage = "Accessibility permission is required. Automatic routing was stopped and normal playback was restored."
+            diagnostics.record(
+                "permission-revoked-pass-through",
+                category: "routing",
+                level: .warning
+            )
+            cancelAutomaticDecisions()
+            persistConfiguration()
+            await stopAllAutomaticRoutes()
         }
     }
 
@@ -455,6 +524,8 @@ final class AppModel: ObservableObject {
         isAddingRoute = true
         lastError = nil
         let session = RouteSession(source: source, destination: destination)
+        diagnostics.markRouteTransition()
+        diagnostics.record("start-requested", category: "route")
         sessions[session.id] = session
         routeOrder.append(session.id)
         publishRoutes()
@@ -466,11 +537,13 @@ final class AppModel: ObservableObject {
                 destinationDeviceID: destination.id
             )
             session.state = .running
+            diagnostics.record("start-succeeded", category: "route")
             startMetricsSampling(for: session.id)
             updateWatchedDeviceIDs()
             chooseSuggestedInputs()
             publishRoutes()
         } catch {
+            diagnostics.record("start-failed", category: "route", level: .error)
             sessions.removeValue(forKey: session.id)
             routeOrder.removeAll { $0 == session.id }
             lastError = String(describing: error)
@@ -481,6 +554,8 @@ final class AppModel: ObservableObject {
 
     func stopRoute(_ routeID: UUID, preserveAutomaticMode: Bool = false) async {
         guard let session = sessions[routeID] else { return }
+        diagnostics.markRouteTransition()
+        diagnostics.record("stop-requested", category: "route")
         let wasAutomaticRoute = session.isAutomatic
         session.state = .stopping
         session.metricsTask?.cancel()
@@ -498,6 +573,7 @@ final class AppModel: ObservableObject {
         }
 
         sessions.removeValue(forKey: routeID)
+        diagnostics.record("stop-completed", category: "route")
         routeOrder.removeAll { $0 == routeID }
         if wasAutomaticRoute {
             automaticRouteIDs.removeValue(forKey: session.sourcePID)
@@ -527,6 +603,8 @@ final class AppModel: ObservableObject {
               }) else { return }
 
         session.state = .switching
+        diagnostics.markRouteTransition()
+        diagnostics.record("switch-requested", category: "route")
         session.metricsTask?.cancel()
         session.metricsTask = nil
         session.notice = nil
@@ -539,11 +617,13 @@ final class AppModel: ObservableObject {
             session.destinationUID = destination.uid
             session.destinationName = destination.name
             session.state = .running
+            diagnostics.record("switch-succeeded", category: "route")
             if persistDestination {
                 cacheAutomaticSession(session)
             }
             startMetricsSampling(for: routeID)
         } catch {
+            diagnostics.record("switch-failed", category: "route", level: .error)
             session.error = String(describing: error)
             if session.probe.isRunning {
                 session.state = .running
@@ -560,6 +640,7 @@ final class AppModel: ObservableObject {
     }
 
     func quit() {
+        diagnostics.record("quit-requested", category: "application")
         hardwareRefreshTask?.cancel()
         cancelAutomaticDecisions()
         for session in sessions.values {
@@ -594,6 +675,29 @@ final class AppModel: ObservableObject {
         }
     }
 
+    private func makeSupportReport() -> String {
+        let info = Bundle.main.infoDictionary ?? [:]
+        let version = info["CFBundleShortVersionString"] as? String ?? "development"
+        let build = info["CFBundleVersion"] as? String ?? "development"
+        return SupportReportBuilder.makeReport(SupportReportInput(
+            generatedAt: Date(),
+            appVersion: version,
+            appBuild: build,
+            operatingSystem: ProcessInfo.processInfo.operatingSystemVersionString,
+            appUptimeSeconds: Date().timeIntervalSince(launchDate),
+            accessibilityGranted: accessibilityGranted,
+            routingEnabled: automaticRoutingEnabled,
+            displayCount: displays.count,
+            managedDisplayCount: mappings.filter { $0.behavior == .routeToDevice }.count,
+            headphoneOverrideArmed: headphoneOverrideEnabled,
+            headphoneOverrideActive: activeHeadphoneOverrideDevice != nil,
+            devices: devices,
+            routes: routes,
+            resources: .current(),
+            events: diagnostics.snapshot()
+        ))
+    }
+
     private func scheduleHardwareReconciliation() {
         hardwareRefreshTask?.cancel()
         hardwareRefreshTask = Task { [weak self] in
@@ -619,6 +723,11 @@ final class AppModel: ObservableObject {
             }
 
             if didDisconnectHeadphoneOverride {
+                diagnostics.record(
+                    "headphone-override-disconnected",
+                    category: "hardware",
+                    level: .warning
+                )
                 await relinquishDisconnectedHeadphoneOverride()
             }
 
@@ -628,29 +737,24 @@ final class AppModel: ObservableObject {
                 let intendedDestination = knownDestination.flatMap { $0.isAlive ? $0 : nil }
                 session.destinationDeviceID = knownDestination?.id
 
-                switch session.state {
-                case .running:
-                    guard let intendedDestination,
-                          intendedDestination.id == session.probe.currentDestinationDeviceID else {
-                        await enterSafeRecovery(for: routeID)
-                        continue
-                    }
-
-                case .waitingForDestination:
-                    if intendedDestination != nil {
-                        beginReconnectDwell(for: routeID)
-                    }
-
-                case .reconnecting:
-                    if intendedDestination == nil {
-                        session.reconnectTask?.cancel()
-                        session.reconnectTask = nil
-                        session.state = .waitingForDestination
-                        session.notice = "\(session.destinationName) disappeared again. Normal playback remains restored."
-                    }
-
-                case .idle, .starting, .switching, .stopping, .failed:
+                let recoveryAction = RouteHardwareRecoveryPolicy.action(
+                    state: session.state,
+                    destinationIsAlive: intendedDestination != nil,
+                    destinationMatchesRenderer: intendedDestination?.id
+                        == session.probe.currentDestinationDeviceID
+                )
+                switch recoveryAction {
+                case .none:
                     break
+                case .enterSafePassThrough:
+                    await enterSafeRecovery(for: routeID)
+                case .beginReconnectDwell:
+                    beginReconnectDwell(for: routeID)
+                case .cancelReconnectAndWait:
+                    session.reconnectTask?.cancel()
+                    session.reconnectTask = nil
+                    session.state = .waitingForDestination
+                    session.notice = "\(session.destinationName) disappeared again. Normal playback remains restored."
                 }
             }
             updateWatchedDeviceIDs()
@@ -664,6 +768,7 @@ final class AppModel: ObservableObject {
                 )
             }
         } catch {
+            diagnostics.record("refresh-failed", category: "hardware", level: .error)
             if clearErrorOnSuccess {
                 lastError = String(describing: error)
             }
@@ -1236,6 +1341,12 @@ final class AppModel: ObservableObject {
 
     private func enterSafeRecovery(for routeID: UUID) async {
         guard let session = sessions[routeID], session.state == .running else { return }
+        diagnostics.markRouteTransition()
+        diagnostics.record(
+            "safe-pass-through-entered",
+            category: "route",
+            level: .warning
+        )
         session.state = .stopping
         session.metricsTask?.cancel()
         session.metricsTask = nil
@@ -1332,6 +1443,7 @@ final class AppModel: ObservableObject {
             maximumQueuedFrameCount: session.metrics.maximumQueuedFrameCount,
             capacityFrameCount: session.metrics.capacityFrameCount
         )
+        session.lastReportedHealthLevel = .observing
         let start = ContinuousClock.now
         session.metricsTask = Task { [weak self] in
             var didCompleteWarmUp = false
@@ -1353,6 +1465,21 @@ final class AppModel: ObservableObject {
                     metrics: current.metrics,
                     elapsedSeconds: elapsedSeconds
                 )
+                if current.health.level != current.lastReportedHealthLevel {
+                    current.lastReportedHealthLevel = current.health.level
+                    switch current.health.level {
+                    case .observing:
+                        break
+                    case .healthy:
+                        self.diagnostics.record("healthy", category: "route-health")
+                    case .needsAttention:
+                        self.diagnostics.record(
+                            "buffer-needs-attention",
+                            category: "route-health",
+                            level: .warning
+                        )
+                    }
+                }
                 self.publishRoutes()
                 try? await Task.sleep(for: .seconds(1))
             }

@@ -4,7 +4,7 @@ AudioOrbit is a native macOS menu-bar app that routes an application's audio to 
 
 ## Current status
 
-The repository contains an integrated, hardware-tested MVP. The next phase is onboarding, application rules, broader hardware testing, diagnostics, and release hardening.
+The repository contains an integrated, hardware-tested MVP with first-launch guidance, privacy-safe diagnostics, automated CI, and release tooling. The remaining release gates are the hardware endurance matrix, measured performance budgets, VoiceOver validation, and credentialed Developer ID/notarization testing.
 
 Implemented today:
 
@@ -22,6 +22,9 @@ Implemented today:
 - Headphone Override for sending all managed audio to one selected connected output, with clean restoration of display routing on disconnect.
 - A native AppKit status item, SwiftUI popover and Settings scene, including application icons, right-click Enable/Disable and a temporary Dock icon while Settings is open.
 - A layered Icon Composer app icon with native Liquid Glass, Dark and Mono appearances, plus Xcode-generated compatibility artwork for macOS 14.2.
+- A one-time welcome window that explains display mapping and both permissions without enabling routing prematurely.
+- A previewable, exportable support report with anonymous output/route labels, resource measurements, audio-health counters and bounded coded events.
+- Unified logging and Instruments signposts for hardware refreshes and route transitions.
 
 ## Requirements
 
@@ -39,7 +42,7 @@ Run the automated suite from Xcode, or from Terminal:
 xcodebuild -project AudioOrbit.xcodeproj -scheme AudioOrbit test
 ```
 
-The suite currently contains 41 tests covering the real-time bridge, sample-rate conversion and drift correction, buffer health, display/window policy, concurrent route admission, persistence and schema migration, Core Audio error formatting, and helper-process association.
+The suite currently contains 50 tests covering the real-time bridge, sample-rate conversion and drift correction, buffer health, display/window policy, route recovery and permission-revocation policy, concurrent route admission, diagnostics redaction, onboarding persistence, configuration migration, Core Audio error formatting, and helper-process association.
 
 ## Using AudioOrbit
 
@@ -73,8 +76,18 @@ Debug builds use a project-specific local designated requirement so Accessibilit
 
 After replacing an older ad-hoc build, remove the old AudioOrbit entry from **System Settings → Privacy & Security → Accessibility** once, then grant the current build access.
 
+## Release preparation
+
+- `scripts/build-release.sh` creates and verifies a Developer ID archive and ZIP when `AUDIOORBIT_TEAM_ID` is set.
+- `scripts/notarize-release.sh` submits, staples and validates the ZIP using an `AUDIOORBIT_NOTARY_PROFILE` Keychain profile.
+- `scripts/profile-running-app.sh` records a Time Profiler trace from a running test scenario.
+- `docs/RELEASE_CHECKLIST.md` is the hardware, recovery, accessibility and distribution gate.
+- `docs/PERFORMANCE_BUDGETS.md` defines the initial latency, audio-health and resource budgets.
+
 ## Documentation
 
 - [Project specification](PROJECT_SPEC.md)
 - [Audio routing architecture decision](docs/ADR-001-audio-routing-engine.md)
 - [Known limitations](KNOWN_LIMITATIONS.md)
+- [Release checklist](docs/RELEASE_CHECKLIST.md)
+- [Performance budgets](docs/PERFORMANCE_BUDGETS.md)

@@ -85,7 +85,7 @@ The following are explicitly outside v1:
 ### Required
 
 - [x] Menu-bar app with routing on/off control and status.
-- [ ] First-run onboarding for Accessibility and System Audio Recording permission.
+- [x] First-run onboarding that explains Accessibility and the first-route System Audio Recording prompt, with user-initiated access and Settings actions.
 - [x] Enumeration of connected displays and eligible output audio devices.
 - [x] Persistent display-to-device mapping.
 - [x] Window observation and deterministic selected-window/display resolution.
@@ -93,7 +93,7 @@ The following are explicitly outside v1:
 - [x] Concurrent routing of at least two independent audio-producing processes to two distinct devices.
 - [x] Debounced rerouting when the selected window changes display.
 - [x] Safe fallback when the destination device or display disappears.
-- [ ] Diagnostics view and exportable text report containing metadata and events, never audio.
+- [x] Diagnostics view and previewable exportable text report containing anonymous metadata, health counters and coded events, never audio.
 - [ ] Unit, integration, and manual hardware tests.
 
 ### Implemented product extensions
@@ -115,7 +115,7 @@ The following are explicitly outside v1:
 
 ### 7.1 First launch target
 
-The dedicated onboarding flow is the next product milestone. Until it is implemented, permission remediation and mapping are available in Settings.
+The dedicated welcome window is shown once on first launch. It explains display mapping, Accessibility, the first-route System Audio Recording prompt and the safe disabled starting state. Configuration remains in the Settings scene.
 
 1. Explain the product in one sentence and show a short route example.
 2. Request Accessibility permission using a user-initiated action. Explain that it is used only to read window focus, position, and size.
@@ -272,7 +272,7 @@ The names below describe logical responsibilities. Current concrete types includ
 - Uses `OSLog` categories and signposts outside the real-time callback.
 - Produces a redacted support report.
 
-This logical component is not implemented yet. Current health metrics are internal and covered by tests; raw feasibility counters are intentionally not exposed to end users.
+The current implementation provides a bounded coded event recorder, unified logging, performance signposts, resource sampling, anonymous route/output health summaries, preview and text export. Raw feasibility controls remain intentionally absent from end-user Settings.
 
 ## 10. Window and display selection policy
 
@@ -597,13 +597,8 @@ Wrap `OSStatus` in a typed error that includes operation, four-character-code re
 ### Structured event fields
 
 - Monotonic timestamp and wall-clock timestamp.
-- Route generation.
-- Bundle identifier and PID for runtime diagnostics; allow names/identifiers to be redacted on export.
-- Display UUID/name hint.
-- Audio device UID/name hint.
-- Previous/new route state and reason code.
-- OSStatus operation/value where applicable.
-- Debounce candidate start/commit/cancel.
+- Stable category and reason code. The bounded in-process event buffer intentionally avoids application, PID, display and audio-device identities rather than collecting and later redacting them.
+- Route transitions, safe-pass-through recovery, permission revocation, hardware refresh failure and audio-health status changes.
 - Sample rate, channel count, buffer size, and latency metadata.
 - Sampled underflow, overflow, discontinuity, and late-callback counters.
 
@@ -677,7 +672,7 @@ Test on the minimum OS and the latest supported macOS release with:
 
 Automated tests must not assume particular hardware names or UIDs.
 
-The current automated suite contains 41 passing tests. Checked items above mean deterministic coverage exists in this repository; unchecked hardware and failure-injection items remain required even when related behavior has been exercised manually.
+The current automated suite contains 50 passing tests. Checked items above mean deterministic coverage exists in this repository; unchecked hardware and failure-injection items remain required even when related behavior has been exercised manually.
 
 ## 22. Milestones
 
@@ -699,9 +694,9 @@ Core feasibility is complete and ADR-001 accepts the current architecture for th
 
 ### Milestone 1 — Project foundation and discovery
 
-- [x] Create app target, test target, module boundaries and dependency root. A hosted CI workflow remains future work.
+- [x] Create app target, test target, module boundaries, dependency root and hosted macOS CI workflow.
 - [x] Implement display and audio-device enumeration with stable IDs and listeners.
-- [ ] Implement permission manager and onboarding skeleton.
+- [x] Implement permission remediation, deterministic revocation policy and first-launch onboarding.
 - [x] Implement versioned mapping, remembered-route and Headphone Override persistence with migration and corrupt-file recovery.
 
 ### Milestone 2 — Window tracking and route decisions
@@ -726,7 +721,7 @@ Core feasibility is complete and ADR-001 accepts the current architecture for th
 
 ### Milestone 5 — Diagnostics, hardening, and release candidate
 
-- [ ] Add structured logs, signposts, counters, redaction, and support report export.
+- [x] Add structured coded logs, signposts, counters, privacy-by-design redaction, preview and support report export.
 - [ ] Complete the hardware/OS/manual test matrix.
 - [ ] Profile CPU, memory, wakeups, audio latency, and callback deadlines.
 - [ ] Verify signing/notarization/update behavior and permission persistence.
@@ -767,7 +762,7 @@ Set final numeric budgets from Milestone 0 measurements and target hardware, the
 
 - [x] Permission explanations state exactly why window metadata and system audio access are needed.
 - [x] No audio content is stored or transmitted.
-- [ ] Exported diagnostics are previewable and exclude audio, window titles, and document paths by default.
+- [x] Exported diagnostics are previewable and exclude audio, application/device/display identity, window titles, document paths and user file paths.
 - [ ] All main controls and route states are usable with VoiceOver and without color-only cues.
 
 ## 24. Implementation guidance for Codex

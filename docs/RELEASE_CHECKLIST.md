@@ -55,6 +55,7 @@ For every row, confirm normal macOS playback returns promptly and the source is 
 
 ## 6. Signing and distribution
 
+- [ ] The release bundle identifier is `me.snowzjx.AudioOrbit` and the archived app reports the intended version/build.
 - [ ] Archive using the intended Developer ID Application identity and Team ID.
 - [ ] Verify the signature, designated requirement and Hardened Runtime.
 - [ ] Submit the ZIP with `notarytool`, wait for acceptance, staple the ticket and run Gatekeeper assessment.

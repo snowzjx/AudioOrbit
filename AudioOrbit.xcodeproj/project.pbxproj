@@ -320,8 +320,8 @@
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = Config/Info.plist;
 				MARKETING_VERSION = 0.1.0;
-				OTHER_CODE_SIGN_FLAGS = "--requirements '=designated => identifier \"com.audioorbit.app\" and info[AudioOrbitLocalDevelopmentIdentity] = \"4C4776C5-86E0-4CB7-94DA-EAA234293C3D\"'";
-				PRODUCT_BUNDLE_IDENTIFIER = com.audioorbit.app;
+				OTHER_CODE_SIGN_FLAGS = "--requirements '=designated => identifier \"me.snowzjx.AudioOrbit\" and info[AudioOrbitLocalDevelopmentIdentity] = \"4C4776C5-86E0-4CB7-94DA-EAA234293C3D\"'";
+				PRODUCT_BUNDLE_IDENTIFIER = me.snowzjx.AudioOrbit;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_OBJC_BRIDGING_HEADER = "AudioOrbit/Realtime/AudioOrbit-Bridging-Header.h";
@@ -337,11 +337,12 @@
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
 				DEAD_CODE_STRIPPING = YES;
+				DEVELOPMENT_TEAM = A47Y4XPLXR;
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = Config/Info.plist;
 				MARKETING_VERSION = 0.1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.audioorbit.app;
+				PRODUCT_BUNDLE_IDENTIFIER = me.snowzjx.AudioOrbit;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_OBJC_BRIDGING_HEADER = "AudioOrbit/Realtime/AudioOrbit-Bridging-Header.h";
@@ -356,7 +357,7 @@
 				CODE_SIGN_STYLE = Automatic;
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 14.2;
-				PRODUCT_BUNDLE_IDENTIFIER = com.audioorbit.app.tests;
+				PRODUCT_BUNDLE_IDENTIFIER = me.snowzjx.AudioOrbit.Tests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_VERSION = 5.0;
 				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/AudioOrbit.app/Contents/MacOS/AudioOrbit";
@@ -370,7 +371,7 @@
 				CODE_SIGN_STYLE = Automatic;
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 14.2;
-				PRODUCT_BUNDLE_IDENTIFIER = com.audioorbit.app.tests;
+				PRODUCT_BUNDLE_IDENTIFIER = me.snowzjx.AudioOrbit.Tests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_VERSION = 5.0;
 				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/AudioOrbit.app/Contents/MacOS/AudioOrbit";

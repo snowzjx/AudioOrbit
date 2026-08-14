@@ -32,6 +32,8 @@ Implemented today:
 - Xcode 26, or another Xcode containing the macOS 14.2+ Core Audio process-tap SDK.
 - A signed build so macOS can persist privacy permissions reliably.
 
+The production bundle identifier is `me.snowzjx.AudioOrbit`.
+
 ## Build and test
 
 Open `AudioOrbit.xcodeproj`, select the **AudioOrbit** scheme, and run the app. AudioOrbit normally appears only in the menu bar; its Dock icon is shown while the Settings window is open.
@@ -83,6 +85,7 @@ After replacing an older ad-hoc build, remove the old AudioOrbit entry from **Sy
 - `scripts/profile-running-app.sh` records a Time Profiler trace from a running test scenario.
 - `docs/RELEASE_CHECKLIST.md` is the hardware, recovery, accessibility and distribution gate.
 - `docs/PERFORMANCE_BUDGETS.md` defines the initial latency, audio-health and resource budgets.
+- `docs/DISTRIBUTION.md` contains the Developer ID, Keychain, GitHub Secrets, notarization and tag-release walkthrough.
 
 ## Documentation
 
@@ -91,3 +94,4 @@ After replacing an older ad-hoc build, remove the old AudioOrbit entry from **Sy
 - [Known limitations](KNOWN_LIMITATIONS.md)
 - [Release checklist](docs/RELEASE_CHECKLIST.md)
 - [Performance budgets](docs/PERFORMANCE_BUDGETS.md)
+- [Developer ID and GitHub distribution](docs/DISTRIBUTION.md)

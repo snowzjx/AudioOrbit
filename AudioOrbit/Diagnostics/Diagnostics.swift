@@ -20,11 +20,11 @@ final class DiagnosticsRecorder: @unchecked Sendable {
     static let shared = DiagnosticsRecorder()
 
     private let logger = Logger(
-        subsystem: Bundle.main.bundleIdentifier ?? "com.audioorbit.app",
+        subsystem: Bundle.main.bundleIdentifier ?? "me.snowzjx.AudioOrbit",
         category: "Lifecycle"
     )
     private let signposter = OSSignposter(
-        subsystem: Bundle.main.bundleIdentifier ?? "com.audioorbit.app",
+        subsystem: Bundle.main.bundleIdentifier ?? "me.snowzjx.AudioOrbit",
         category: "Performance"
     )
     private let lock = NSLock()

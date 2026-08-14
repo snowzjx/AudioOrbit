@@ -24,7 +24,7 @@ The support report's `estimated-buffer-latency` is the target queue depth divide
 | One-hour four-route run | Less than 20 MB resident-memory growth after initial warm-up |
 | Real-time callbacks | No deadline misses attributable to allocation, locks, logging or UI work |
 
-Use Instruments' Time Profiler, System Trace, Allocations and Audio templates where available. AudioOrbit emits `Hardware refresh` and `Route transition` signposts in the `com.audioorbit.app` subsystem. The in-app support report includes process CPU time, resident memory and per-route buffer counters.
+Use Instruments' Time Profiler, System Trace, Allocations and Audio templates where available. AudioOrbit emits `Hardware refresh` and `Route transition` signposts in the `me.snowzjx.AudioOrbit` subsystem. The in-app support report includes process CPU time, resident memory and per-route buffer counters.
 
 ## Recording a result
 

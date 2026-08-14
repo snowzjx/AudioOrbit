@@ -79,6 +79,7 @@ The following are explicitly outside v1:
 - Treat output devices as independently clocked. The bridge must tolerate sample-rate mismatch and drift rather than assuming identical clocks.
 - Never capture, persist, transmit, or analyze audio content beyond the in-memory buffers required to route it.
 - Debug builds may use a stable local designated requirement for TCC continuity. Developer ID, App Sandbox, hardened runtime, notarization, update behavior and the intended distribution path must be validated before release.
+- The direct-distribution application identifier is `me.snowzjx.AudioOrbit`. GitHub Releases are the initial delivery channel; the Mac App Store is not required for the first release.
 
 ## 6. MVP scope
 

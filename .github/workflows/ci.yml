@@ -15,14 +15,18 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Build and test
-        run: >-
-          xcodebuild
-          -project AudioOrbit.xcodeproj
-          -scheme AudioOrbit
-          -configuration Debug
-          -destination 'platform=macOS'
-          -derivedDataPath "$RUNNER_TEMP/AudioOrbitDerivedData"
-          test
+        run: |
+          TEST_INFO_PLIST="$RUNNER_TEMP/AudioOrbit-TestHost-Info.plist"
+          cp Config/Info.plist "$TEST_INFO_PLIST"
+          plutil -replace LSMultipleInstancesProhibited -bool NO "$TEST_INFO_PLIST"
+          xcodebuild \
+            -project AudioOrbit.xcodeproj \
+            -scheme AudioOrbit \
+            -configuration Debug \
+            -destination 'platform=macOS' \
+            -derivedDataPath "$RUNNER_TEMP/AudioOrbitDerivedData" \
+            INFOPLIST_FILE="$TEST_INFO_PLIST" \
+            test
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')

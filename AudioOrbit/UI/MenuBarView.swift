@@ -130,7 +130,7 @@ struct MenuBarView: View {
                 .help("Retry restoring normal playback")
                 .accessibilityLabel("Retry cleanup for \(route.sourceName)")
             }
-            if route.isAutomatic, !route.isCached {
+            if route.isAutomatic, !route.isCached, route.supportsManualReanchor {
                 Button {
                     Task { await model.reanchorRouteToFocusedWindow(route.id) }
                 } label: {

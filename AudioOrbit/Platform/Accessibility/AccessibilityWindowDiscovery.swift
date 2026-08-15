@@ -59,6 +59,10 @@ struct AccessibilityWindowDiscovery {
             for: associationReason
         ) ? visibleSurfaceCandidates(processPID: windowOwner.pid) : []
 
+        let surfaceAssignments = assignSurfaceIdentifiers(
+            to: windows,
+            surfaces: surfaceCandidates
+        )
         let accessibilityCandidates = windows.enumerated().compactMap { index, window in
             candidate(
                 from: window,
@@ -66,7 +70,7 @@ struct AccessibilityWindowDiscovery {
                 index: index,
                 isFocused: focusedWindow.map { CFEqual($0, window) } ?? false,
                 isMain: mainWindow.map { CFEqual($0, window) } ?? false,
-                visibleSurfaces: surfaceCandidates
+                matchedSurfaceIdentifier: surfaceAssignments[index]
             )
         }
         let candidates: [WindowCandidateSnapshot]
@@ -222,7 +226,7 @@ struct AccessibilityWindowDiscovery {
         index: Int,
         isFocused: Bool,
         isMain: Bool,
-        visibleSurfaces: [WindowCandidateSnapshot]
+        matchedSurfaceIdentifier: String?
     ) -> WindowCandidateSnapshot? {
         guard let position = pointAttribute(window, kAXPositionAttribute as CFString),
               let size = sizeAttribute(window, kAXSizeAttribute as CFString) else { return nil }
@@ -231,7 +235,7 @@ struct AccessibilityWindowDiscovery {
         let isNormalWindow = role == (kAXWindowRole as String)
             && (subrole == nil || subrole == (kAXStandardWindowSubrole as String))
         let frame = CGRect(origin: position, size: size)
-        let identifier = bestSurfaceMatch(for: frame, surfaces: visibleSurfaces)
+        let identifier = matchedSurfaceIdentifier
             ?? stringAttribute(window, kAXIdentifierAttribute as CFString)
             ?? "ax:\(processPID):\(index)"
         return WindowCandidateSnapshot(
@@ -247,31 +251,46 @@ struct AccessibilityWindowDiscovery {
         )
     }
 
-    /// Matches an AX window frame to its Core Graphics surface by overlap
-    /// instead of edge tolerance. AX frames and CG bounds legitimately
-    /// differ by the title bar, shadow and coordinate rounding, and an
-    /// exact-edge match made Safari windows fall back to their unstable AX
-    /// identifier (`SafariWindow?IsSecure=…`), which changed between ticks
-    /// and caused the anchor to oscillate. CG window numbers are stable
-    /// for the window's lifetime, including while its tab is dragged.
-    private func bestSurfaceMatch(
-        for frame: CGRect,
+    /// Assigns each AX window a distinct Core Graphics surface by largest
+    /// overlap instead of edge tolerance. AX frames and CG bounds
+    /// legitimately differ by the title bar, shadow and coordinate
+    /// rounding, and an exact-edge match made Safari windows fall back to
+    /// their unstable AX identifier, which changed between ticks and made
+    /// the anchor oscillate. Windows are processed in AX (front-to-back)
+    /// order and a claimed surface is never reused, so two stacked windows
+    /// cannot collapse onto the same window number.
+    private func assignSurfaceIdentifiers(
+        to windows: [AXUIElement],
         surfaces: [WindowCandidateSnapshot]
-    ) -> String? {
-        var best: (identifier: String, area: CGFloat)?
-        let frameArea = frame.width * frame.height
-        for surface in surfaces {
-            let intersection = frame.intersection(surface.frame)
-            guard !intersection.isNull, !intersection.isEmpty else { continue }
-            let area = intersection.width * intersection.height
-            let surfaceArea = surface.frame.width * surface.frame.height
-            let smallerArea = min(frameArea, surfaceArea)
-            guard smallerArea > 0, area / smallerArea >= 0.5 else { continue }
-            if area > (best?.area ?? 0) {
-                best = (surface.stableIdentifier, area)
+    ) -> [Int: String] {
+        var claimedIdentifiers = Set<String>()
+        var assignments: [Int: String] = [:]
+        for (index, window) in windows.enumerated() {
+            guard let position = pointAttribute(window, kAXPositionAttribute as CFString),
+                  let size = sizeAttribute(window, kAXSizeAttribute as CFString) else {
+                continue
+            }
+            let frame = CGRect(origin: position, size: size)
+            let frameArea = frame.width * frame.height
+            var best: (identifier: String, area: CGFloat)?
+            for surface in surfaces
+                where !claimedIdentifiers.contains(surface.stableIdentifier) {
+                let intersection = frame.intersection(surface.frame)
+                guard !intersection.isNull, !intersection.isEmpty else { continue }
+                let area = intersection.width * intersection.height
+                let surfaceArea = surface.frame.width * surface.frame.height
+                let smallerArea = min(frameArea, surfaceArea)
+                guard smallerArea > 0, area / smallerArea >= 0.5 else { continue }
+                if area > (best?.area ?? 0) {
+                    best = (surface.stableIdentifier, area)
+                }
+            }
+            if let best {
+                claimedIdentifiers.insert(best.identifier)
+                assignments[index] = best.identifier
             }
         }
-        return best?.identifier
+        return assignments
     }
     /// Reads the renderer pid of the window's active tab from Safari's
     /// BrowserView identifier (`BrowserView?IsPageLoaded=…&WebViewProcessID=NNN`).

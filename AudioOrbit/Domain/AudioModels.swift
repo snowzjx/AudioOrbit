@@ -107,6 +107,7 @@ struct ProbeRouteSnapshot: Identifiable, Equatable, Sendable {
     var notice: String?
     var error: String?
     var requiresCleanupRetry = false
+    var supportsManualReanchor = false
 
     var isRecovering: Bool {
         state == .waitingForDestination || state == .reconnecting

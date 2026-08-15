@@ -1361,9 +1361,23 @@ final class AppModel: ObservableObject {
                 ages[identifier, default: 0] += 1
             }
             windowIdentifierAges[ownerPID] = ages
-            if let anchor = state.committedWindowIdentifier,
+            // Adopt the anchor window's renderer only when doing so cannot
+            // destroy a still-live playback signal. While a playing tab
+            // moves between windows, Safari may activate another tab in the
+            // anchor window, so its BrowserView pid no longer belongs to the
+            // media. Keep the saved pid while it is still reported anywhere
+            // (the moved tab keeps its renderer), and only re-adopt once the
+            // old renderer is gone and the anchor window shows media again.
+            if source.isRunningOutput,
+               let anchor = state.committedWindowIdentifier,
                let anchorPID = pidMap[anchor] {
-                state.anchoredWebViewProcessID = anchorPID
+                let savedPID = state.anchoredWebViewProcessID
+                let savedStillReported = savedPID.map { pidMap.values.contains($0) }
+                    ?? false
+                let anchorPlaysMedia = mediaIdentifiers.contains(anchor)
+                if savedPID == nil || (!savedStillReported && anchorPlaysMedia) {
+                    state.anchoredWebViewProcessID = anchorPID
+                }
             }
             let targetID: String?
             if source.isRunningOutput,
@@ -2000,7 +2014,11 @@ final class AppModel: ObservableObject {
                 health: session.health,
                 notice: session.notice,
                 error: session.error,
-                requiresCleanupRetry: session.cleanupCompletion != nil
+                requiresCleanupRetry: session.cleanupCompletion != nil,
+                supportsManualReanchor: automaticTracking[session.sourcePID]
+                    .flatMap { $0.association }
+                    .map { WindowRouteAffinityPolicy.pinsInitialWindow(for: $0.reason) }
+                    ?? false
             )
         }
         let liveBundles = Set(liveRoutes.compactMap {

@@ -33,7 +33,7 @@ final class AppModel: ObservableObject {
 
     private final class RouteSession {
         let id = UUID()
-        let sourcePID: pid_t
+        var sourcePID: pid_t
         let sourceName: String
         let audioProcessName: String
         let applicationBundleIdentifier: String?
@@ -99,6 +99,7 @@ final class AppModel: ObservableObject {
         var anchoredWebViewProcessID: pid_t?
         var anchoredPIDMissingTickCount = 0
         var manualAnchorOverride = false
+        var forceImmediateDecision = false
     }
 
     private static let hardwareChangeCoalescingDelay = Duration.milliseconds(100)
@@ -1163,8 +1164,19 @@ final class AppModel: ObservableObject {
         let vanishedPIDs = trackedPIDs.filter { !currentPIDs.contains($0) }
         for pid in vanishedPIDs {
             automaticTracking[pid]?.decisionTask?.cancel()
-            automaticTracking.removeValue(forKey: pid)
-            await stopAutomaticRoute(for: pid)
+            let trackedState = automaticTracking.removeValue(forKey: pid)
+            guard automaticRouteIDs[pid] != nil else { continue }
+            // Safari restarts its media helper (WebKit.GPU) during
+            // fullscreen transitions. When a replacement source exists for
+            // the same owner, migrate the route to it instead of stopping,
+            // so the audio never falls back mid-transition.
+            if let replacement = replacementSource(forVanishedPID: pid),
+               let trackedState {
+                automaticTracking[replacement.pid] = trackedState
+                await migrateAutomaticRoute(fromPID: pid, to: replacement)
+            } else {
+                await stopAutomaticRoute(for: pid)
+            }
         }
 
         // A playback-session boundary releases the window anchor. Require
@@ -1354,6 +1366,11 @@ final class AppModel: ObservableObject {
         guard automaticRoutingEnabled else { return }
         let state = automaticTracking[source.pid] ?? AutomaticTrackingState()
         automaticTracking[source.pid] = state
+        var effectiveForce = force
+        if state.forceImmediateDecision {
+            effectiveForce = true
+            state.forceImmediateDecision = false
+        }
         state.wasRunningOutput = source.isRunningOutput
         state.association = association
         state.evidence = evidence
@@ -1395,6 +1412,7 @@ final class AppModel: ObservableObject {
                 }
             }
             let targetID: String?
+            var pidDerivedTarget = false
             if state.manualAnchorOverride {
                 // The user pinned this window manually; automatic
                 // following stays suppressed until the playback session
@@ -1412,6 +1430,7 @@ final class AppModel: ObservableObject {
                    windowsWithPID[0] != state.committedWindowIdentifier {
                     state.anchoredPIDMissingTickCount = 0
                     targetID = windowsWithPID[0]
+                    pidDerivedTarget = true
                 } else if state.committedWindowIdentifier.map({ windowsWithPID.contains($0) }) ?? false {
                     // The playing tab is still in the anchor window.
                     state.anchoredPIDMissingTickCount = 0
@@ -1419,10 +1438,19 @@ final class AppModel: ObservableObject {
                 } else {
                     // The renderer is not reported anywhere this tick.
                     // Tolerate transient Accessibility gaps before falling
-                    // back, so a short hiccup cannot yank the audio.
+                    // back, so a short hiccup cannot yank the audio. A
+                    // fullscreen transition removes the standard AX window
+                    // entirely; while the anchor window is invisible and no
+                    // replacement window has appeared, keep holding instead
+                    // of letting the focus-driven indicator take over.
                     state.anchoredPIDMissingTickCount += 1
+                    let anchorInvisible = anchorIsTemporarilyInvisible(
+                        state: state,
+                        evidence: evidence
+                    )
                     if state.anchoredPIDMissingTickCount
-                        >= Self.anchoredPIDMissingToleranceTicks {
+                        >= Self.anchoredPIDMissingToleranceTicks,
+                       !anchorInvisible {
                         targetID = Self.bestMediaTarget(mediaIdentifiers, ages: ages)
                     } else {
                         targetID = nil
@@ -1444,7 +1472,13 @@ final class AppModel: ObservableObject {
                     state.mediaAnchorDwellTickCount = 1
                 }
                 state.mediaAnchorMissTickCount = 0
-                if state.mediaAnchorDwellTickCount >= Self.mediaAnchorDwellTicks {
+                // A renderer-identity target is deterministic: one
+                // confirming tick is enough. Indicator-derived targets
+                // keep the longer dwell because the signal is noisier.
+                let requiredDwell = pidDerivedTarget
+                    ? 1
+                    : Self.mediaAnchorDwellTicks
+                if state.mediaAnchorDwellTickCount >= requiredDwell {
                     state.mediaAnchorDwellTickCount = 0
                     state.mediaAnchorMissTickCount = 0
                     state.pendingMediaAnchorID = nil
@@ -1452,6 +1486,7 @@ final class AppModel: ObservableObject {
                     state.anchorMissTickCount = 0
                     state.anchoredWebViewProcessID = pidMap[targetID]
                         ?? state.anchoredWebViewProcessID
+                    state.forceImmediateDecision = true
                     diagnostics.record(
                         "playback-anchor-followed-media-window",
                         category: "routing"
@@ -1486,7 +1521,11 @@ final class AppModel: ObservableObject {
             // followed so later focus changes stop moving established audio.
             if state.committedWindowIdentifier != nil,
                evidence?.selectedWindowIdentifier != nil,
-               evidence?.selectionSource != .routeAnchor {
+               evidence?.selectionSource != .routeAnchor,
+               !anchorIsTemporarilyInvisible(
+                   state: state,
+                   evidence: evidence
+               ) {
                 state.anchorMissTickCount += 1
                 if state.anchorMissTickCount >= Self.anchorStalenessTicks {
                     state.anchorMissTickCount = 0
@@ -1511,9 +1550,16 @@ final class AppModel: ObservableObject {
         // Native and HTML video fullscreen transitions can temporarily remove
         // the standard AX window even though the audio process keeps playing.
         // Retain an established route on its last connected display instead of
-        // audibly falling back to the system default. A newly playing process
-        // still requires positive window evidence before its first route.
-        if candidateDisplayUUID == nil,
+        // audibly falling back to the system default or another focused
+        // window. This also covers the case where the evidence selects a
+        // fallback window while the anchor is merely invisible — fullscreen
+        // must never move the audio. A newly playing process still requires
+        // positive window evidence before its first route.
+        let anchorTemporarilyInvisible = anchorIsTemporarilyInvisible(
+            state: state,
+            evidence: evidence
+        )
+        if candidateDisplayUUID == nil || anchorTemporarilyInvisible,
            let committedDisplayUUID = state.committedDisplayUUID,
            displays.contains(where: { $0.id == committedDisplayUUID }),
            let routeID = automaticRouteIDs[source.pid],
@@ -1543,7 +1589,7 @@ final class AppModel: ObservableObject {
             state.decisionTask = nil
             return
         }
-        guard force || !state.hasCandidate || state.candidateDisplayUUID != candidateDisplayUUID else {
+        guard effectiveForce || !state.hasCandidate || state.candidateDisplayUUID != candidateDisplayUUID else {
             return
         }
         state.hasCandidate = true
@@ -1553,7 +1599,7 @@ final class AppModel: ObservableObject {
             !displays.contains { $0.id == committed }
         } ?? false
         let delay = requestedDelay
-            ?? (force || committedDisplayDisconnected
+            ?? (effectiveForce || committedDisplayDisconnected
                 ? .zero
                 : (candidateDisplayUUID == nil
                     ? Self.noEligibleWindowGrace
@@ -1696,8 +1742,28 @@ final class AppModel: ObservableObject {
         let minimumAge = mediaIdentifiers.map { ages[$0] ?? 0 }.min() ?? 0
         let freshest = mediaIdentifiers.filter { (ages[$0] ?? 0) == minimumAge }
         guard freshest.count == 1,
-              minimumAge <= freshMediaWindowAgeTicks else { return nil }
+              minimumAge <= Self.freshMediaWindowAgeTicks else { return nil }
         return freshest.first
+    }
+
+    /// True when the anchored window is currently invisible and no
+    /// replacement window has appeared — the signature of a fullscreen
+    /// transition, which removes the standard AX window while the audio
+    /// keeps playing. While this holds, the route must keep its last
+    /// committed display instead of following the fallback selection or
+    /// the focus-driven media indicator.
+    private func anchorIsTemporarilyInvisible(
+        state: AutomaticTrackingState,
+        evidence: WindowDisplayEvidence?
+    ) -> Bool {
+        guard let anchorID = state.committedWindowIdentifier else { return false }
+        guard let evidence else { return true }
+        let currentIDs = Set(evidence.candidateWindowIdentifiers)
+        if currentIDs.contains(anchorID) { return false }
+        let ages = windowIdentifierAges[evidence.windowOwnerPID] ?? [:]
+        return !currentIDs.contains { identifier in
+            (ages[identifier] ?? 0) <= Self.freshMediaWindowAgeTicks
+        }
     }
 
     private func startAutomaticRoute(
@@ -1755,6 +1821,85 @@ final class AppModel: ObservableObject {
             publishRoutes()
         }
         updateAutomaticRoutingSummary()
+    }
+
+    /// Finds a running replacement source for a vanished one: same visible
+    /// owner (bundle identifier) via process association, currently
+    /// producing output, not already routed and not suppressed.
+    private func replacementSource(forVanishedPID vanishedPID: pid_t) -> AudioProcessSnapshot? {
+        guard let routeID = automaticRouteIDs[vanishedPID],
+              let session = sessions[routeID],
+              let ownerBundleIdentifier = session.applicationBundleIdentifier else {
+            return nil
+        }
+        return processes.first { candidate in
+            candidate.isRunningOutput
+                && candidate.pid != vanishedPID
+                && automaticRouteIDs[candidate.pid] == nil
+                && !activeSourcePIDs.contains(candidate.pid)
+                && !suppressedAutomaticSourcePIDs.contains(candidate.pid)
+                && processWindowResolver.resolve(candidate)?.windowOwner
+                    .bundleIdentifier == ownerBundleIdentifier
+        }
+    }
+
+    /// Re-parents an automatic route to a replacement source process,
+    /// preserving the session, anchors and destination. Safari restarting
+    /// its media helper during a fullscreen transition then costs only a
+    /// tap re-attach instead of a full stop/recreate cycle.
+    private func migrateAutomaticRoute(
+        fromPID vanishedPID: pid_t,
+        to replacement: AudioProcessSnapshot
+    ) async {
+        guard let routeID = automaticRouteIDs[vanishedPID],
+              let session = sessions[routeID],
+              let destination = devices.first(where: {
+                  $0.uid == session.destinationUID && $0.isAlive
+              }) else {
+            await stopAutomaticRoute(for: vanishedPID)
+            return
+        }
+        diagnostics.markRouteTransition()
+        diagnostics.record(
+            "route-migrated-process",
+            category: "routing",
+            level: .warning
+        )
+        session.state = .stopping
+        session.metricsTask?.cancel()
+        session.metricsTask = nil
+        publishRoutes()
+        if session.probe.isRunning {
+            try? session.probe.stop()
+        }
+        guard !session.probe.isRunning else {
+            // The old tap could not be detached; give up and restore
+            // pass-through instead of double-tapping.
+            await stopRoute(routeID, preserveAutomaticMode: true)
+            return
+        }
+        automaticRouteIDs.removeValue(forKey: vanishedPID)
+        automaticRouteIDs[replacement.pid] = routeID
+        session.sourcePID = replacement.pid
+        session.sourceObjectID = replacement.id
+        do {
+            try session.probe.start(
+                processObjectID: replacement.id,
+                destinationDeviceID: destination.id
+            )
+            session.destinationDeviceID = destination.id
+            session.state = .running
+            session.notice = "Safari restarted its media helper; the route was kept alive."
+            session.error = nil
+            startMetricsSampling(for: routeID)
+        } catch {
+            session.state = .failed
+            session.error = "AudioOrbit could not keep the route after the media helper restarted: \(error)"
+            automaticRouteIDs.removeValue(forKey: replacement.pid)
+            await stopRoute(routeID, preserveAutomaticMode: true)
+        }
+        updateWatchedDeviceIDs()
+        publishRoutes()
     }
 
     private func stopAutomaticRoute(for sourcePID: pid_t) async {

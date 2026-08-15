@@ -41,7 +41,9 @@ struct AccessibilityWindowDiscovery {
                 windowFrame: nil,
                 displayUUID: nil,
                 displayName: nil,
-                issue: "Accessibility permission is required to inspect application windows."
+                issue: "Accessibility permission is required to inspect application windows.",
+                candidateWindowIdentifiers: [],
+                focusedWindowIdentifier: nil
             )
         }
         let windows = elementArrayAttribute(
@@ -88,11 +90,30 @@ struct AccessibilityWindowDiscovery {
             WindowDisplayPolicy.selectWindow(from: [$0], displays: displays) != nil
         }.count
 
-        guard let selection = WindowDisplayPolicy.selectWindow(
+        var selection = WindowDisplayPolicy.selectWindow(
             from: candidates,
             displays: displays,
             preferredWindowIdentifier: preferredWindowIdentifier
-        ) else {
+        )
+        // Safari marks the playing tab's window with a per-window audio
+        // indicator in its chrome. When the anchor did not match, prefer
+        // that window over focus/largest-visible so a video that starts in
+        // a background window still routes to the right display. Chrome
+        // controls replicated across every window of an app never trigger
+        // this, because the rule requires exactly one matching window.
+        if selection?.source != .routeAnchor {
+            let mediaCandidates = candidates.filter(\.hasMediaIndicator)
+            if mediaCandidates.count == 1,
+               let mediaWindow = mediaCandidates.first,
+               mediaWindow.stableIdentifier != selection?.window.stableIdentifier,
+               WindowDisplayPolicy.selectWindow(
+                   from: [mediaWindow],
+                   displays: displays
+               ) != nil {
+                selection = (mediaWindow, .mediaIndicator)
+            }
+        }
+        guard let selection else {
             return WindowDisplayEvidence(
                 sourcePID: process.pid,
                 sourceName: windowOwner.name,
@@ -105,7 +126,13 @@ struct AccessibilityWindowDiscovery {
                 windowFrame: nil,
                 displayUUID: nil,
                 displayName: nil,
-                issue: "No visible application window intersects a connected display."
+                issue: "No visible application window intersects a connected display.",
+                candidateWindowIdentifiers: candidates.map(\.stableIdentifier),
+                focusedWindowIdentifier: candidates.first(where: \.isFocused)?
+                    .stableIdentifier,
+                mediaPlayingWindowIdentifiers: candidates.filter(\.hasMediaIndicator)
+                    .map(\.stableIdentifier),
+                webViewProcessIDsByWindow: Self.webViewProcessMap(from: candidates)
             )
         }
 
@@ -126,7 +153,26 @@ struct AccessibilityWindowDiscovery {
             windowFrame: selection.window.frame,
             displayUUID: display?.id,
             displayName: display?.name,
-            issue: display == nil ? "The selected window does not intersect a connected display." : nil
+            issue: display == nil ? "The selected window does not intersect a connected display." : nil,
+            candidateWindowIdentifiers: candidates.map(\.stableIdentifier),
+            focusedWindowIdentifier: candidates.first(where: \.isFocused)?
+                .stableIdentifier,
+            mediaPlayingWindowIdentifiers: candidates.filter(\.hasMediaIndicator)
+                .map(\.stableIdentifier),
+            webViewProcessIDsByWindow: Self.webViewProcessMap(from: candidates)
+        )
+    }
+
+    private static func webViewProcessMap(
+        from candidates: [WindowCandidateSnapshot]
+    ) -> [String: pid_t] {
+        Dictionary(
+            candidates.compactMap { candidate in
+                candidate.webViewProcessID.map {
+                    (candidate.stableIdentifier, $0)
+                }
+            },
+            uniquingKeysWith: { first, _ in first }
         )
     }
 
@@ -185,12 +231,7 @@ struct AccessibilityWindowDiscovery {
         let isNormalWindow = role == (kAXWindowRole as String)
             && (subrole == nil || subrole == (kAXStandardWindowSubrole as String))
         let frame = CGRect(origin: position, size: size)
-        let matchingSurfaceIdentifiers = visibleSurfaces.compactMap { surface in
-            framesApproximatelyMatch(frame, surface.frame) ? surface.stableIdentifier : nil
-        }
-        let identifier = (matchingSurfaceIdentifiers.count == 1
-            ? matchingSurfaceIdentifiers[0]
-            : nil)
+        let identifier = bestSurfaceMatch(for: frame, surfaces: visibleSurfaces)
             ?? stringAttribute(window, kAXIdentifierAttribute as CFString)
             ?? "ax:\(processPID):\(index)"
         return WindowCandidateSnapshot(
@@ -200,16 +241,113 @@ struct AccessibilityWindowDiscovery {
             isMain: isMain,
             isMinimized: boolAttribute(window, kAXMinimizedAttribute as CFString) ?? false,
             isNormalWindow: isNormalWindow,
-            frontToBackIndex: index
+            frontToBackIndex: index,
+            hasMediaIndicator: mediaIndicatorFound(in: window, depth: 0),
+            webViewProcessID: browserViewProcessID(in: window, depth: 0)
         )
     }
 
-    private func framesApproximatelyMatch(_ lhs: CGRect, _ rhs: CGRect) -> Bool {
-        let tolerance: CGFloat = 2
-        return abs(lhs.minX - rhs.minX) <= tolerance
-            && abs(lhs.minY - rhs.minY) <= tolerance
-            && abs(lhs.width - rhs.width) <= tolerance
-            && abs(lhs.height - rhs.height) <= tolerance
+    /// Matches an AX window frame to its Core Graphics surface by overlap
+    /// instead of edge tolerance. AX frames and CG bounds legitimately
+    /// differ by the title bar, shadow and coordinate rounding, and an
+    /// exact-edge match made Safari windows fall back to their unstable AX
+    /// identifier (`SafariWindow?IsSecure=…`), which changed between ticks
+    /// and caused the anchor to oscillate. CG window numbers are stable
+    /// for the window's lifetime, including while its tab is dragged.
+    private func bestSurfaceMatch(
+        for frame: CGRect,
+        surfaces: [WindowCandidateSnapshot]
+    ) -> String? {
+        var best: (identifier: String, area: CGFloat)?
+        let frameArea = frame.width * frame.height
+        for surface in surfaces {
+            let intersection = frame.intersection(surface.frame)
+            guard !intersection.isNull, !intersection.isEmpty else { continue }
+            let area = intersection.width * intersection.height
+            let surfaceArea = surface.frame.width * surface.frame.height
+            let smallerArea = min(frameArea, surfaceArea)
+            guard smallerArea > 0, area / smallerArea >= 0.5 else { continue }
+            if area > (best?.area ?? 0) {
+                best = (surface.stableIdentifier, area)
+            }
+        }
+        return best?.identifier
+    }
+    /// Reads the renderer pid of the window's active tab from Safari's
+    /// BrowserView identifier (`BrowserView?IsPageLoaded=…&WebViewProcessID=NNN`).
+    /// A torn-off tab keeps its renderer process, so the window that reports
+    /// the anchored pid after a move is the playback window — this tracks
+    /// the media's actual host, not the chrome window identity.
+    private func browserViewProcessID(in element: AXUIElement, depth: Int) -> pid_t? {
+        guard depth <= 4 else { return nil }
+        if let identifier = stringAttribute(element, kAXIdentifierAttribute as CFString),
+           identifier.hasPrefix("BrowserView?"),
+           let range = identifier.range(of: "WebViewProcessID=") {
+            let digits = identifier[range.upperBound...].prefix(while: \.isNumber)
+            return digits.isEmpty ? nil : Int(digits).map(pid_t.init)
+        }
+        guard let children = elementArrayAttribute(
+            element,
+            kAXChildrenAttribute as CFString
+        ) else {
+            return nil
+        }
+        for child in children {
+            if let pid = browserViewProcessID(in: child, depth: depth + 1) {
+                return pid
+            }
+        }
+        return nil
+    }
+
+    /// Detects whether a window's chrome exposes a media-playing indicator,
+    /// such as the mute button Safari places in a tab while that tab plays
+    /// audio. Only window chrome metadata is read — never titles and never
+    /// web content, which the walk explicitly avoids descending into.
+    private static let mediaIndicatorMarkers = [
+        "mute", "unmute", "speaker", "playing", "audio",
+        "静音", "播放", "声音",
+    ]
+
+    private static let mediaMetadataAttributes: [String] = [
+        kAXRoleDescriptionAttribute,
+        kAXSubroleAttribute,
+        kAXIdentifierAttribute,
+        kAXDescriptionAttribute,
+        kAXHelpAttribute,
+    ]
+
+    private func matchesMediaMarker(_ value: String) -> Bool {
+        let lowercased = value.lowercased()
+        return Self.mediaIndicatorMarkers.contains(where: lowercased.contains)
+    }
+    
+    private func mediaIndicatorFound(in element: AXUIElement, depth: Int) -> Bool {
+        guard depth <= 6 else { return false }
+        for name in Self.mediaMetadataAttributes {
+            guard let value = stringAttribute(element, name as CFString) else {
+                continue
+            }
+            if matchesMediaMarker(value) {
+                return true
+            }
+        }
+        let role = (stringAttribute(element, kAXRoleAttribute as CFString) ?? "")
+            .lowercased()
+        if role.contains("webarea") || role.contains("scrollarea")
+            || role.contains("textarea") {
+            return false
+        }
+        guard let children = elementArrayAttribute(
+            element,
+            kAXChildrenAttribute as CFString
+        ) else {
+            return false
+        }
+        for child in children where mediaIndicatorFound(in: child, depth: depth + 1) {
+            return true
+        }
+        return false
     }
 
     private func attribute(_ element: AXUIElement, _ name: CFString) -> CFTypeRef? {

@@ -12,11 +12,10 @@ final class AppModel: ObservableObject {
     @Published private(set) var routes: [ProbeRouteSnapshot] = []
     @Published var selectedProcessID: AudioObjectID?
     @Published var selectedDeviceID: AudioObjectID?
-    @Published var selectedWindowProcessID: AudioObjectID?
     @Published private(set) var isAddingRoute = false
     @Published private(set) var accessibilityGranted = false
-    @Published private(set) var windowEvidence: WindowDisplayEvidence?
     @Published private(set) var windowDiscoveryMessage: String?
+    @Published private(set) var launchAtLoginEnabled = false
     @Published private(set) var automaticRoutingEnabled = false
     @Published private(set) var automaticRoutingMessage: String?
     @Published private(set) var headphoneOverrideEnabled = false
@@ -92,6 +91,12 @@ final class AppModel: ObservableObject {
         var association: ProcessWindowAssociation?
         var evidence: WindowDisplayEvidence?
         var decisionTask: Task<Void, Never>?
+        var silentTickCount = 0
+        var anchorMissTickCount = 0
+        var mediaAnchorDwellTickCount = 0
+        var mediaAnchorMissTickCount = 0
+        var pendingMediaAnchorID: String?
+        var anchoredWebViewProcessID: pid_t?
     }
 
     private static let hardwareChangeCoalescingDelay = Duration.milliseconds(100)
@@ -100,6 +105,11 @@ final class AppModel: ObservableObject {
     private static let displayChangeDwell = Duration.milliseconds(500)
     private static let noEligibleWindowGrace = Duration.seconds(1)
     private static let cleanupRetryDelay = Duration.seconds(1)
+    private static let playbackSessionSilenceTicks = 2
+    private static let anchorStalenessTicks = 16
+    private static let mediaAnchorDwellTicks = 3
+    private static let mediaAnchorMissToleranceTicks = 3
+    private static let freshMediaWindowAgeTicks = 12
 
     private let discovery = AudioDiscovery()
     private let deviceMonitor = AudioDeviceMonitor()
@@ -119,7 +129,13 @@ final class AppModel: ObservableObject {
     private var automaticRouteIDs: [pid_t: UUID] = [:]
     private var cachedApplicationRoutes: [CachedApplicationRoute] = []
     private var suppressedAutomaticSourcePIDs: Set<pid_t> = []
+
+
+    private var windowIdentifierAges: [pid_t: [String: Int]] = [:]
+    private var reportedUnassociatedSourcePIDs: Set<pid_t> = []
+    private var reportedSessionEvidenceIssuePIDs: Set<pid_t> = []
     private var applicationActivationObserver: NSObjectProtocol?
+    private var hasPerformedTerminationCleanup = false
 
     var menuBarSymbol: String {
         if routes.contains(where: { $0.state == .waitingForDestination || $0.state == .failed }) {
@@ -195,6 +211,7 @@ final class AppModel: ObservableObject {
         self.diagnostics = diagnostics
         self.onboardingStore = onboardingStore
         hasCompletedOnboarding = onboardingStore.isCompleted
+        launchAtLoginEnabled = LaunchAtLogin.isEnabled
         let loadedConfiguration = mappingStore.load()
         mappings = loadedConfiguration.configuration.mappings
         automaticRoutingEnabled = loadedConfiguration.configuration.routingEnabled
@@ -238,14 +255,49 @@ final class AppModel: ObservableObject {
     func refresh() async {
         guard !isAddingRoute, !hasControlPlaneTransition else { return }
         diagnostics.markRefresh()
+        refreshLaunchAtLoginStatus()
         await reconcileAudioHardware(clearErrorOnSuccess: true)
         await refreshWindowEvidence()
+    }
+
+    func setLaunchAtLoginEnabled(_ enabled: Bool) async {
+        do {
+            try LaunchAtLogin.setEnabled(enabled)
+            diagnostics.record(
+                enabled ? "launch-at-login-enabled" : "launch-at-login-disabled",
+                category: "application"
+            )
+            lastError = nil
+        } catch {
+            lastError = "AudioOrbit could not update the launch-at-login setting: \(error)"
+        }
+        refreshLaunchAtLoginStatus()
+    }
+
+    private func refreshLaunchAtLoginStatus() {
+        let currentStatus = LaunchAtLogin.isEnabled
+        if currentStatus != launchAtLoginEnabled {
+            launchAtLoginEnabled = currentStatus
+        }
     }
 
     func refreshSupportReportPreview() {
         supportReportPreview = makeSupportReport()
         supportReportExportMessage = nil
         diagnostics.record("preview-generated", category: "diagnostics")
+    }
+
+
+    func reanchorRouteToFocusedWindow(_ routeID: UUID) async {
+        guard let session = sessions[routeID],
+              let state = automaticTracking[session.sourcePID],
+              let focusedID = state.evidence?.focusedWindowIdentifier,
+              focusedID != state.committedWindowIdentifier else { return }
+        state.committedWindowIdentifier = focusedID
+        state.anchorMissTickCount = 0
+        state.mediaAnchorDwellTickCount = 0
+        diagnostics.record("playback-anchor-manual-repin", category: "routing")
+        await refreshAutomaticWindowEvidence(forceImmediate: true)
     }
 
     func completeOnboarding() {
@@ -471,6 +523,7 @@ final class AppModel: ObservableObject {
     }
 
     func recheckAccessibilityAccess() async {
+        refreshLaunchAtLoginStatus()
         accessibilityGranted = AccessibilityPermission.isGranted
         let permissionAction = PermissionRoutingPolicy.action(
             accessibilityGranted: accessibilityGranted,
@@ -484,15 +537,12 @@ final class AppModel: ObservableObject {
             ensureWindowObservation()
             await refreshWindowEvidence()
         case .keepCurrentState:
-            windowEvidence = nil
             windowObservationTask?.cancel()
             windowObservationTask = nil
         case .continueHeadphoneOverride:
-            windowEvidence = nil
             ensureWindowObservation()
             await refreshAutomaticWindowEvidence()
         case .stopAndRestorePassThrough:
-            windowEvidence = nil
             windowObservationTask?.cancel()
             windowObservationTask = nil
             automaticRoutingEnabled = false
@@ -519,7 +569,6 @@ final class AppModel: ObservableObject {
 
         accessibilityGranted = AccessibilityPermission.isGranted
         guard accessibilityGranted else {
-            windowEvidence = nil
             if automaticRoutingEnabled && headphoneOverrideEnabled {
                 ensureWindowObservation()
                 await refreshAutomaticWindowEvidence()
@@ -530,40 +579,6 @@ final class AppModel: ObservableObject {
             return
         }
         ensureWindowObservation()
-        guard let process = processes.first(where: { $0.id == selectedWindowProcessID }) else {
-            windowEvidence = nil
-            windowDiscoveryMessage = processes.isEmpty
-                ? "No Core Audio application processes are currently available to inspect."
-                : "Choose an application to inspect."
-            if automaticRoutingEnabled {
-                await refreshAutomaticWindowEvidence()
-            }
-            return
-        }
-
-        let currentDisplays = displays
-        let committedDisplayUUID = windowEvidence?.sourcePID == process.pid
-            ? windowEvidence?.displayUUID
-            : nil
-        let association = processWindowResolver.resolve(process)
-        let evidence: WindowDisplayEvidence?
-        if let association {
-            evidence = await Task.detached(priority: .utility) {
-                AccessibilityWindowDiscovery().evidence(
-                    for: process,
-                    windowOwner: association.windowOwner,
-                    associationReason: association.reason,
-                    displays: currentDisplays,
-                    committedDisplayUUID: committedDisplayUUID
-                )
-            }.value
-        } else {
-            evidence = nil
-        }
-        guard process.id == selectedWindowProcessID else { return }
-        windowEvidence = evidence
-        windowDiscoveryMessage = evidence?.issue
-            ?? "AudioOrbit could not safely associate this audio process with a visible application window."
         if automaticRoutingEnabled {
             await refreshAutomaticWindowEvidence()
         }
@@ -832,6 +847,24 @@ final class AppModel: ObservableObject {
                 _ = await switchTask.result
                 session.switchTask = nil
             }
+        }
+        tearDownForTermination()
+        NSApplication.shared.terminate(nil)
+    }
+
+    /// Synchronous fallback for exit paths that do not run `quit()` (for
+    /// example Cmd+Q while the Settings window is key). A destination switch
+    /// still suspended at its gain-ramp wait is safe to overlap with this
+    /// teardown: the probe revalidates callback-object identity after every
+    /// suspension point and aborts the switch instead of touching freed state.
+    func applicationWillTerminate() {
+        tearDownForTermination()
+    }
+
+    private func tearDownForTermination() {
+        guard !hasPerformedTerminationCleanup else { return }
+        hasPerformedTerminationCleanup = true
+        for session in sessions.values {
             try? session.probe.stop()
         }
         sessions.removeAll()
@@ -844,7 +877,6 @@ final class AppModel: ObservableObject {
             NotificationCenter.default.removeObserver(applicationActivationObserver)
             self.applicationActivationObserver = nil
         }
-        NSApplication.shared.terminate(nil)
     }
 
     private var activeSourcePIDs: Set<pid_t> {
@@ -985,9 +1017,6 @@ final class AppModel: ObservableObject {
     private func apply(_ snapshot: AudioDiscoverySnapshot) {
         let selectedDeviceUID = devices.first(where: { $0.id == selectedDeviceID })?.uid
         let selectedProcessPID = processes.first(where: { $0.id == selectedProcessID })?.pid
-        let selectedWindowProcessPID = processes.first(where: {
-            $0.id == selectedWindowProcessID
-        })?.pid
 
         devices = snapshot.devices
         processes = snapshot.processes.filter {
@@ -1002,14 +1031,6 @@ final class AppModel: ObservableObject {
                 processes: processes,
                 activeSourcePIDs: activeSourcePIDs
             )
-        }
-
-        if let selectedWindowProcessPID,
-           let matchingProcess = processes.first(where: { $0.pid == selectedWindowProcessPID }) {
-            selectedWindowProcessID = matchingProcess.id
-        } else {
-            selectedWindowProcessID = processes.first(where: \.isRunningOutput)?.id
-                ?? processes.first?.id
         }
 
         if let selectedDeviceUID,
@@ -1110,6 +1131,8 @@ final class AppModel: ObservableObject {
         guard automaticRoutingEnabled else { return }
         let currentlyPlayingPIDs = Set(processes.filter(\.isRunningOutput).map(\.pid))
         suppressedAutomaticSourcePIDs.formIntersection(currentlyPlayingPIDs)
+        reportedUnassociatedSourcePIDs.formIntersection(currentlyPlayingPIDs)
+        reportedSessionEvidenceIssuePIDs.formIntersection(currentlyPlayingPIDs)
         let sources = processes.filter { source in
             let isRelevant = (source.isRunningOutput
                 && !suppressedAutomaticSourcePIDs.contains(source.pid))
@@ -1131,13 +1154,31 @@ final class AppModel: ObservableObject {
             await stopAutomaticRoute(for: pid)
         }
 
+        // A playback-session boundary releases the window anchor. Require
+        // two consecutive silent ticks before honoring the stopped→running
+        // transition so brief buffering or tab-switch blips cannot re-pin the
+        // anchor to whatever window is focused at the time of the blip.
         for source in processes {
             guard let state = automaticTracking[source.pid] else { continue }
-            if WindowRouteAffinityPolicy.beginsNewPlaybackSession(
-                wasRunningOutput: state.wasRunningOutput,
-                isRunningOutput: source.isRunningOutput
-            ) {
-                state.committedWindowIdentifier = nil
+            if source.isRunningOutput {
+                if WindowRouteAffinityPolicy.beginsNewPlaybackSession(
+                    wasRunningOutput: state.wasRunningOutput,
+                    isRunningOutput: true,
+                    silenceTicks: state.silentTickCount,
+                    requiredSilenceTicks: Self.playbackSessionSilenceTicks
+                ) {
+                    state.committedWindowIdentifier = nil
+                    state.anchorMissTickCount = 0
+                    state.mediaAnchorDwellTickCount = 0
+                    state.anchoredWebViewProcessID = nil
+                    diagnostics.record(
+                        "playback-session-detected",
+                        category: "routing"
+                    )
+                }
+                state.silentTickCount = 0
+            } else {
+                state.silentTickCount += 1
             }
             state.wasRunningOutput = source.isRunningOutput
         }
@@ -1148,42 +1189,89 @@ final class AppModel: ObservableObject {
             return
         }
 
+        // Resolve associations and tracking state on the main actor, then
+        // compute window evidence concurrently. A single unresponsive target
+        // application can otherwise stall the evidence for every other source
+        // because Accessibility queries block until their messaging timeout.
         let currentDisplays = displays
-        for source in sources {
-            guard let association = processWindowResolver.resolve(source) else {
+        let evidenceRequests: [(
+            AudioProcessSnapshot,
+            ProcessWindowAssociation?,
+            UUID?,
+            String?
+        )] = sources.map { source in
+                let association = processWindowResolver.resolve(source)
+                if association == nil,
+                   source.isRunningOutput,
+                   !reportedUnassociatedSourcePIDs.contains(source.pid) {
+                    reportedUnassociatedSourcePIDs.insert(source.pid)
+                    diagnostics.record(
+                        "playing-source-unassociated",
+                        category: "routing",
+                        level: .warning
+                    )
+                }
+                let committedDisplayUUID = automaticTracking[source.pid]?.committedDisplayUUID
+                let preferredWindowIdentifier: String?
+                if let state = automaticTracking[source.pid],
+                   let association,
+                   WindowRouteAffinityPolicy.pinsInitialWindow(
+                       for: association.reason
+                   ) {
+                    preferredWindowIdentifier = state.committedWindowIdentifier
+                } else {
+                    preferredWindowIdentifier = nil
+                }
+                return (
+                    source,
+                    association,
+                    committedDisplayUUID,
+                    preferredWindowIdentifier
+                )
+            }
+        await withTaskGroup(
+            of: (
+                AudioProcessSnapshot,
+                ProcessWindowAssociation?,
+                WindowDisplayEvidence?
+            ).self
+        ) { group in
+            for (source, association, committedDisplayUUID, preferredWindowIdentifier)
+                in evidenceRequests {
+                group.addTask(priority: .utility) {
+                    guard let association else { return (source, nil, nil) }
+                    let evidence = AccessibilityWindowDiscovery().evidence(
+                        for: source,
+                        windowOwner: association.windowOwner,
+                        associationReason: association.reason,
+                        displays: currentDisplays,
+                        committedDisplayUUID: committedDisplayUUID,
+                        preferredWindowIdentifier: preferredWindowIdentifier
+                    )
+                    return (source, association, evidence)
+                }
+            }
+            for await (source, association, evidence) in group {
+                if evidence?.issue != nil,
+                   source.isRunningOutput,
+                   automaticRouteIDs[source.pid] != nil
+                       || automaticTracking[source.pid]?.wasRunningOutput == true,
+                   !reportedSessionEvidenceIssuePIDs.contains(source.pid) {
+                    reportedSessionEvidenceIssuePIDs.insert(source.pid)
+                    diagnostics.record(
+                        "session-evidence-issue",
+                        category: "routing",
+                        level: .warning
+                    )
+                }
                 scheduleAutomaticRouteDecision(
                     for: source,
-                    association: nil,
-                    evidence: nil,
+                    association: association,
+                    evidence: evidence,
                     force: forceImmediate,
                     requestedDelay: requestedDelay
                 )
-                continue
             }
-            let committedDisplayUUID = automaticTracking[source.pid]?.committedDisplayUUID
-            let preferredWindowIdentifier = automaticTracking[source.pid]
-                .flatMap { state in
-                    WindowRouteAffinityPolicy.pinsInitialWindow(for: association.reason)
-                        ? state.committedWindowIdentifier
-                        : nil
-                }
-            let evidence = await Task.detached(priority: .utility) {
-                AccessibilityWindowDiscovery().evidence(
-                    for: source,
-                    windowOwner: association.windowOwner,
-                    associationReason: association.reason,
-                    displays: currentDisplays,
-                    committedDisplayUUID: committedDisplayUUID,
-                    preferredWindowIdentifier: preferredWindowIdentifier
-                )
-            }.value
-            scheduleAutomaticRouteDecision(
-                for: source,
-                association: association,
-                evidence: evidence,
-                force: forceImmediate,
-                requestedDelay: requestedDelay
-            )
         }
 
         updateAutomaticRoutingSummary()
@@ -1254,7 +1342,111 @@ final class AppModel: ObservableObject {
         state.wasRunningOutput = source.isRunningOutput
         state.association = association
         state.evidence = evidence
+        if let association,
+           let evidence {
+            // The playback window is identified by the strongest available
+            // signal, in order: (1) the anchored tab's renderer pid — Safari
+            // exposes each window's active-tab WebViewProcessID, and a tab
+            // that keeps its renderer through a tear-off is tracked exactly;
+            // (2) the unique media-indicator window; (3) the freshest media
+            // window — a torn-off tab lands in a freshly created window, so
+            // when the source window keeps a stale indicator and several
+            // windows report media, the newest one is the destination.
+            let ownerPID = association.windowOwner.pid
+            let mediaIdentifiers = Set(evidence.mediaPlayingWindowIdentifiers)
+            let pidMap = evidence.webViewProcessIDsByWindow
+            let currentIDs = Set(evidence.candidateWindowIdentifiers)
+            var ages = windowIdentifierAges[ownerPID] ?? [:]
+            for identifier in currentIDs {
+                ages[identifier, default: 0] += 1
+            }
+            windowIdentifierAges[ownerPID] = ages
+            if let anchor = state.committedWindowIdentifier,
+               let anchorPID = pidMap[anchor] {
+                state.anchoredWebViewProcessID = anchorPID
+            }
+            let targetID: String?
+            if source.isRunningOutput,
+               let anchoredPID = state.anchoredWebViewProcessID {
+                let windowsWithPID = pidMap.filter { $0.value == anchoredPID }
+                    .map(\.key)
+                if windowsWithPID.count == 1,
+                   windowsWithPID[0] != state.committedWindowIdentifier {
+                    targetID = windowsWithPID[0]
+                } else {
+                    targetID = Self.bestMediaTarget(mediaIdentifiers, ages: ages)
+                }
+            } else {
+                targetID = Self.bestMediaTarget(mediaIdentifiers, ages: ages)
+            }
+            if source.isRunningOutput,
+               let targetID,
+               targetID != state.committedWindowIdentifier {
+                // The same window must hold the target for the whole
+                // dwell. Requiring continuity prevents the anchor from
+                // flip-flopping when two windows alternate.
+                if state.pendingMediaAnchorID == targetID {
+                    state.mediaAnchorDwellTickCount += 1
+                } else {
+                    state.pendingMediaAnchorID = targetID
+                    state.mediaAnchorDwellTickCount = 1
+                }
+                state.mediaAnchorMissTickCount = 0
+                if state.mediaAnchorDwellTickCount >= Self.mediaAnchorDwellTicks {
+                    state.mediaAnchorDwellTickCount = 0
+                    state.mediaAnchorMissTickCount = 0
+                    state.pendingMediaAnchorID = nil
+                    state.committedWindowIdentifier = targetID
+                    state.anchorMissTickCount = 0
+                    state.anchoredWebViewProcessID = pidMap[targetID]
+                        ?? state.anchoredWebViewProcessID
+                    diagnostics.record(
+                        "playback-anchor-followed-media-window",
+                        category: "routing"
+                    )
+                }
+            } else if source.isRunningOutput,
+                      let pendingID = state.pendingMediaAnchorID,
+                      mediaIdentifiers.isEmpty
+                          || mediaIdentifiers.contains(pendingID) {
+                // The pending window's indicator is momentarily missing
+                // or shadowed by another window's indicator. Tolerate a
+                // few ticks so a busy Safari cannot starve the dwell.
+                state.mediaAnchorMissTickCount += 1
+                if state.mediaAnchorMissTickCount
+                    >= Self.mediaAnchorMissToleranceTicks {
+                    state.mediaAnchorDwellTickCount = 0
+                    state.mediaAnchorMissTickCount = 0
+                    state.pendingMediaAnchorID = nil
+                }
+            } else {
+                state.mediaAnchorDwellTickCount = 0
+                state.mediaAnchorMissTickCount = 0
+                state.pendingMediaAnchorID = nil
+            }
+        }
         if let association {
+            // A window anchor that no longer matches any eligible window (for
+            // example the anchored Safari window was closed) silently degrades
+            // routing to follow-focus behavior, because every selection falls
+            // back past the preferred identifier. After a short staleness
+            // dwell, re-pin the anchor to the window that is actually being
+            // followed so later focus changes stop moving established audio.
+            if state.committedWindowIdentifier != nil,
+               evidence?.selectedWindowIdentifier != nil,
+               evidence?.selectionSource != .routeAnchor {
+                state.anchorMissTickCount += 1
+                if state.anchorMissTickCount >= Self.anchorStalenessTicks {
+                    state.anchorMissTickCount = 0
+                    state.committedWindowIdentifier = nil
+                    diagnostics.record(
+                        "playback-anchor-repinned",
+                        category: "routing"
+                    )
+                }
+            } else {
+                state.anchorMissTickCount = 0
+            }
             state.committedWindowIdentifier = WindowRouteAffinityPolicy.routeAnchor(
                 existing: state.committedWindowIdentifier,
                 selected: evidence?.selectedWindowIdentifier,
@@ -1435,6 +1627,26 @@ final class AppModel: ObservableObject {
         )
     }
 
+    /// Chooses the media window to follow. A single media window is the
+    /// obvious target. With several, the freshest one wins: a torn-off tab
+    /// lands in a freshly created window whose identifier age is small,
+    /// while the source window's stale indicator keeps a large age. Old
+    /// simultaneous playback stays ambiguous and is left alone.
+    private static func bestMediaTarget(
+        _ mediaIdentifiers: Set<String>,
+        ages: [String: Int]
+    ) -> String? {
+        if mediaIdentifiers.count == 1 {
+            return mediaIdentifiers.first
+        }
+        guard mediaIdentifiers.count > 1 else { return nil }
+        let minimumAge = mediaIdentifiers.map { ages[$0] ?? 0 }.min() ?? 0
+        let freshest = mediaIdentifiers.filter { (ages[$0] ?? 0) == minimumAge }
+        guard freshest.count == 1,
+              minimumAge <= freshMediaWindowAgeTicks else { return nil }
+        return freshest.first
+    }
+
     private func startAutomaticRoute(
         source: AudioProcessSnapshot,
         displayedSourceName: String,
@@ -1603,7 +1815,9 @@ final class AppModel: ObservableObject {
             windowFrame: display.frame,
             displayUUID: display.id,
             displayName: display.name,
-            issue: nil
+            issue: nil,
+            candidateWindowIdentifiers: [],
+            focusedWindowIdentifier: nil
         )
     }
 

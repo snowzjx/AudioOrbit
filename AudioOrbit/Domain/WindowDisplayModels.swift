@@ -16,6 +16,7 @@ enum WindowSelectionSource: String, Equatable, Sendable {
     case main = "Main window"
     case largestVisible = "Largest visible window"
     case routeAnchor = "Playback window"
+    case mediaIndicator = "Playing media window"
 }
 
 struct WindowCandidateSnapshot: Equatable, Sendable {
@@ -26,6 +27,8 @@ struct WindowCandidateSnapshot: Equatable, Sendable {
     let isMinimized: Bool
     let isNormalWindow: Bool
     let frontToBackIndex: Int
+    var hasMediaIndicator = false
+    var webViewProcessID: pid_t?
 }
 
 struct WindowDisplayEvidence: Equatable, Sendable {
@@ -41,6 +44,10 @@ struct WindowDisplayEvidence: Equatable, Sendable {
     let displayUUID: UUID?
     let displayName: String?
     let issue: String?
+    let candidateWindowIdentifiers: [String]
+    let focusedWindowIdentifier: String?
+    var mediaPlayingWindowIdentifiers: [String] = []
+    var webViewProcessIDsByWindow: [String: pid_t] = [:]
 }
 
 enum WindowDisplayPolicy {
@@ -139,9 +146,13 @@ enum WindowRouteAffinityPolicy {
 
     static func beginsNewPlaybackSession(
         wasRunningOutput: Bool?,
-        isRunningOutput: Bool
+        isRunningOutput: Bool,
+        silenceTicks: Int = 0,
+        requiredSilenceTicks: Int = 0
     ) -> Bool {
-        wasRunningOutput == false && isRunningOutput
+        wasRunningOutput == false
+            && isRunningOutput
+            && silenceTicks >= requiredSilenceTicks
     }
 }
 

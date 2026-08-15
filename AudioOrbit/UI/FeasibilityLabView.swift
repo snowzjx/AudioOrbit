@@ -11,6 +11,7 @@ struct AudioOrbitSettingsView: View {
                 .tabItem { Label("Displays", systemImage: "display.2") }
 
             settingsPage {
+                startup
                 headphoneOverride
                 ignoredApplications
             }
@@ -79,6 +80,31 @@ struct AudioOrbitSettingsView: View {
                     .padding(11)
                     .background(.quaternary, in: RoundedRectangle(cornerRadius: 10))
                 }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.top, 4)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var startup: some View {
+        GroupBox("Startup") {
+            VStack(alignment: .leading, spacing: 10) {
+                Toggle(
+                    "Launch AudioOrbit at login",
+                    isOn: Binding(
+                        get: { model.launchAtLoginEnabled },
+                        set: { enabled in
+                            Task { await model.setLaunchAtLoginEnabled(enabled) }
+                        }
+                    )
+                )
+                .accessibilityHint("Starts AudioOrbit automatically when you log in")
+
+                Text("AudioOrbit can be removed at any time in System Settings → General → Login Items.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.top, 4)

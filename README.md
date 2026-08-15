@@ -5,11 +5,12 @@ AudioOrbit is a native macOS menu-bar app that sends each application's audio to
 ## Key features
 
 - Automatic display-to-audio-output routing for multiple applications.
-- Stable Safari and helper-process routing, including full-screen transitions and playback-window anchoring.
+- Stable Safari and helper-process routing, including full-screen transitions, playback-window anchoring, and following a playing tab dragged to another window or display.
 - Smooth live destination switching with sample-rate conversion and adaptive clock correction.
 - Persistent display mappings, remembered routes, and application-level ignore rules.
 - Headphone Override sends all managed audio to one selected device and restores display routing when it disconnects.
 - Physical-device volume controls when the output exposes a writable Core Audio volume control.
+- Optional launch at login from Settings → General.
 - Safe pass-through when permission, capture, or destination failures occur.
 - Private by design: audio stays in bounded volatile memory and is never stored, transmitted, transcribed, or analyzed.
 
@@ -30,7 +31,7 @@ The production bundle identifier is `me.snowzjx.AudioOrbit`.
 
 Moving the selected window to another mapped display moves its audio after a short stable delay. Removing a route permanently ignores that application until **Settings → General → Allow Again** is selected.
 
-Safari media routes stay anchored to the window where playback began, so using another Safari window does not move established audio. Safari does not expose reliable public per-tab audio ownership, so simultaneous tabs or background autoplay can remain ambiguous.
+Safari media routes stay anchored to the window where playback began, so using another Safari window does not move established audio. Dragging the playing tab into another window — including tearing it off into a new window on another display — follows the audio to the destination window after a short dwell. Safari does not expose reliable public per-tab audio ownership, so simultaneous tabs or background autoplay can remain ambiguous.
 
 ## Build and test
 
@@ -46,6 +47,4 @@ The automated suite contains 58 tests.
 
 - [Product specification](PROJECT_SPEC.md)
 - [Audio routing architecture](docs/ADR-001-audio-routing-engine.md)
-- [Release checklist](docs/RELEASE_CHECKLIST.md)
 - [Performance budgets](docs/PERFORMANCE_BUDGETS.md)
-- [Developer ID and GitHub distribution](docs/DISTRIBUTION.md)

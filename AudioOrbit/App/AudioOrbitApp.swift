@@ -49,6 +49,10 @@ final class AudioOrbitAppDelegate: NSObject, NSApplicationDelegate {
             controller.present()
         }
     }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        model.applicationWillTerminate()
+    }
 }
 
 @MainActor

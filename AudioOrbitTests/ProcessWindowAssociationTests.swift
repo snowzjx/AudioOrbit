@@ -284,7 +284,9 @@ final class ProcessWindowAssociationTests: XCTestCase {
             windowFrame: .init(x: 0, y: 0, width: 500, height: 500),
             displayUUID: display.id,
             displayName: display.name,
-            issue: nil
+            issue: nil,
+            candidateWindowIdentifiers: ["window"],
+            focusedWindowIdentifier: "window"
         )
     }
 }

@@ -105,11 +105,12 @@ The following are explicitly outside v1:
 - [x] User-selected Headphone Override with automatic display-route restoration on disconnect.
 - [x] Conservative Safari/WebKit helper association and established-route retention through full-screen transitions.
 - [x] Playback-window affinity for helper processes so unrelated focus changes do not move established routes.
+- [x] Safari tab-tear-off following: dragging a playing tab into another window, or tearing it off into a new window, hands the media indicator to the destination window and the playback anchor follows after a short dwell.
 - [x] Layered Icon Composer app icon with Default, Dark and Mono appearances and generated legacy-macOS artwork.
+- [x] Optional launch at login via `SMAppService.mainApp`, managed from Settings → General.
 
 ### Optional only after required behavior is stable
 
-- [ ] Launch at login.
 - [x] Per-application exclude/pass-through list.
 - [ ] Configurable debounce duration in an Advanced settings section.
 - [x] Menu-bar display of live and remembered routes with application icons.
@@ -293,6 +294,8 @@ Evaluate in this order:
 
 For an audio helper associated with a separate visible application process, the first selected window becomes that route's playback-window anchor. Subsequent focus changes to another window of the same application must not move the established route. Resolve the anchor with a stable public Core Graphics window number where possible. If the anchored window temporarily disappears during a full-screen or Space transition, retain the last committed display instead of falling back to another focused window. Moving the anchored window itself may still move the route after the normal display dwell and hysteresis policy. A confirmed audio-output stop followed by a new start on a reused helper process begins a new playback session and releases the old window anchor.
 
+
+When the playing tab itself moves, the anchor must follow the media, not the chrome: Safari marks the playing tab's window with a per-window audio indicator and exposes the active tab's renderer identity (WebViewProcessID) in its window chrome. Dragging the playing tab into another window, or tearing it off into a brand-new window, transfers those signals to the destination window without interrupting audio. The anchor then follows, in order of preference: the window reporting the anchored tab's renderer identity, the unique media-indicator window, or the freshest media window after a short dwell with transient-AX tolerance. Simultaneous playback in several windows stays with the established anchor.
 An eligible window must:
 
 - Belong to the process.
@@ -809,9 +812,7 @@ AudioOrbitTests/
 Config/
 docs/
 ├── ADR-001-audio-routing-engine.md
-├── DISTRIBUTION.md
-├── PERFORMANCE_BUDGETS.md
-└── RELEASE_CHECKLIST.md
+└── PERFORMANCE_BUDGETS.md
 PROJECT_SPEC.md
 README.md
 ```

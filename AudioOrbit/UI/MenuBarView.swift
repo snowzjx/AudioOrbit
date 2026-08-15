@@ -130,6 +130,17 @@ struct MenuBarView: View {
                 .help("Retry restoring normal playback")
                 .accessibilityLabel("Retry cleanup for \(route.sourceName)")
             }
+            if route.isAutomatic, !route.isCached {
+                Button {
+                    Task { await model.reanchorRouteToFocusedWindow(route.id) }
+                } label: {
+                    Image(systemName: "scope")
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .help("Anchor this route to the focused window now")
+                .accessibilityLabel("Anchor \(route.sourceName) to the focused window")
+            }
             Button(role: .destructive) {
                 Task { await model.ignoreRoute(route.id) }
             } label: {

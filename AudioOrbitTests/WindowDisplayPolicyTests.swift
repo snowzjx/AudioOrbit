@@ -118,6 +118,18 @@ final class WindowDisplayPolicyTests: XCTestCase {
             wasRunningOutput: false,
             isRunningOutput: true
         ))
+        XCTAssertFalse(WindowRouteAffinityPolicy.beginsNewPlaybackSession(
+            wasRunningOutput: false,
+            isRunningOutput: true,
+            silenceTicks: 1,
+            requiredSilenceTicks: 2
+        ))
+        XCTAssertTrue(WindowRouteAffinityPolicy.beginsNewPlaybackSession(
+            wasRunningOutput: false,
+            isRunningOutput: true,
+            silenceTicks: 2,
+            requiredSilenceTicks: 2
+        ))
     }
 
     func testLargestIntersectionWorksWithNegativeAndVerticallyStackedCoordinates() throws {

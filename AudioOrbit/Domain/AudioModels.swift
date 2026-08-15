@@ -106,6 +106,7 @@ struct ProbeRouteSnapshot: Identifiable, Equatable, Sendable {
     var health: AudioRouteHealth = AudioRouteHealth()
     var notice: String?
     var error: String?
+    var requiresCleanupRetry = false
 
     var isRecovering: Bool {
         state == .waitingForDestination || state == .reconnecting
@@ -118,6 +119,7 @@ enum AudioRouteProbeError: Error, CustomStringConvertible {
     case invalidDestinationSampleRate
     case unableToAllocateBridge
     case gainRampTimedOut
+    case routeLifecycleChanged
 
     var description: String {
         switch self {
@@ -131,6 +133,8 @@ enum AudioRouteProbeError: Error, CustomStringConvertible {
             "AudioOrbit could not allocate the bounded real-time audio buffer."
         case .gainRampTimedOut:
             "The output did not complete its safety ramp in time. The existing route was retained."
+        case .routeLifecycleChanged:
+            "The route changed while an output switch was in progress. AudioOrbit safely cancelled the switch."
         }
     }
 }

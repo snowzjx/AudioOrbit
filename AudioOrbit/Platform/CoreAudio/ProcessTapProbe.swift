@@ -15,6 +15,19 @@ final class ProcessTapProbe {
     private(set) var currentDestinationDeviceID: AudioObjectID?
 
     var isRunning: Bool { ioProcID != nil }
+    var hasActiveRoute: Bool {
+        isRunning && outputRenderer != nil && bridge != nil
+    }
+    var requiresCleanup: Bool {
+        ioProcID != nil
+            || outputRenderer != nil
+            || bridge != nil
+            || aggregateDeviceID != kAudioObjectUnknown
+            || tapID != kAudioObjectUnknown
+    }
+    var isNormalPlaybackRestored: Bool {
+        tapID == kAudioObjectUnknown
+    }
 
     deinit {
         try? stop()
@@ -169,10 +182,15 @@ final class ProcessTapProbe {
 
         AOAudioBridgeBeginGainRamp(bridge, 0, gainRampFrames)
         do {
-            try await waitForGainRamp(on: bridge)
+            try await waitForGainRamp(on: bridge, outputRenderer: outputRenderer)
         } catch {
-            AOAudioBridgeBeginGainRamp(bridge, 1, gainRampFrames)
+            if routeIsActive(bridge: bridge, outputRenderer: outputRenderer) {
+                AOAudioBridgeBeginGainRamp(bridge, 1, gainRampFrames)
+            }
             throw error
+        }
+        guard routeIsActive(bridge: bridge, outputRenderer: outputRenderer) else {
+            throw AudioRouteProbeError.routeLifecycleChanged
         }
 
         do {
@@ -211,6 +229,7 @@ final class ProcessTapProbe {
 
     private func tearDown() throws {
         var firstError: Error?
+        var captureCallbackDetached = true
 
         if let ioProcID {
             let stopStatus = AudioDeviceStop(aggregateDeviceID, ioProcID)
@@ -218,10 +237,17 @@ final class ProcessTapProbe {
                 firstError = CoreAudioError(operation: "Stop tap IO", status: stopStatus)
             }
             let destroyStatus = AudioDeviceDestroyIOProcID(aggregateDeviceID, ioProcID)
-            if destroyStatus != noErr, firstError == nil {
-                firstError = CoreAudioError(operation: "Destroy tap IO procedure", status: destroyStatus)
+            if destroyStatus == noErr {
+                self.ioProcID = nil
+            } else {
+                captureCallbackDetached = false
+                if firstError == nil {
+                    firstError = CoreAudioError(
+                        operation: "Destroy tap IO procedure",
+                        status: destroyStatus
+                    )
+                }
             }
-            self.ioProcID = nil
         }
 
         if let outputRenderer {
@@ -230,33 +256,62 @@ final class ProcessTapProbe {
             } catch {
                 if firstError == nil { firstError = error }
             }
-            self.outputRenderer = nil
+            if !outputRenderer.requiresCleanup {
+                self.outputRenderer = nil
+            }
         }
 
-        if let bridge {
-            AOAudioBridgeDestroy(bridge)
-            self.bridge = nil
+        // The capture IO procedure owns a raw pointer to the bridge. Preserve
+        // the bridge and all HAL objects it depends on until the callback is
+        // definitively detached; a later cleanup retry can safely continue.
+        guard captureCallbackDetached else {
+            throw firstError ?? CoreAudioError(
+                operation: "Detach tap IO procedure",
+                status: kAudioHardwareUnspecifiedError
+            )
         }
 
         if aggregateDeviceID != kAudioObjectUnknown {
             let status = AudioHardwareDestroyAggregateDevice(aggregateDeviceID)
-            if status != noErr, firstError == nil {
-                firstError = CoreAudioError(operation: "Destroy private aggregate device", status: status)
+            if status == noErr {
+                aggregateDeviceID = AudioObjectID(kAudioObjectUnknown)
+            } else if firstError == nil {
+                firstError = CoreAudioError(
+                    operation: "Destroy private aggregate device",
+                    status: status
+                )
             }
-            aggregateDeviceID = AudioObjectID(kAudioObjectUnknown)
         }
 
-        if tapID != kAudioObjectUnknown {
+        // The aggregate retains the tap. Do not discard either object ID on a
+        // failed destroy, otherwise cleanup cannot be retried and the source
+        // may remain muted without an owner in the control plane.
+        if aggregateDeviceID == kAudioObjectUnknown,
+           tapID != kAudioObjectUnknown {
             let status = AudioHardwareDestroyProcessTap(tapID)
-            if status != noErr, firstError == nil {
-                firstError = CoreAudioError(operation: "Destroy process tap", status: status)
+            if status == noErr {
+                tapID = AudioObjectID(kAudioObjectUnknown)
+            } else if firstError == nil {
+                firstError = CoreAudioError(
+                    operation: "Destroy process tap",
+                    status: status
+                )
             }
-            tapID = AudioObjectID(kAudioObjectUnknown)
         }
 
-        tapFormat = nil
-        gainRampFrames = 0
-        currentDestinationDeviceID = nil
+        // Both IO callbacks hold raw bridge pointers. The tap callback was
+        // detached above; retain the bridge until the physical renderer has
+        // also been disposed successfully.
+        if outputRenderer == nil, let bridge {
+            AOAudioBridgeDestroy(bridge)
+            self.bridge = nil
+        }
+
+        if bridge == nil {
+            tapFormat = nil
+            gainRampFrames = 0
+            currentDestinationDeviceID = nil
+        }
 
         if let firstError { throw firstError }
     }
@@ -288,15 +343,33 @@ final class ProcessTapProbe {
         return format
     }
 
-    private func waitForGainRamp(on bridge: OpaquePointer) async throws {
+    private func waitForGainRamp(
+        on bridge: OpaquePointer,
+        outputRenderer: PhysicalOutputRenderer
+    ) async throws {
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: .milliseconds(250))
-        while AOAudioBridgeRead(bridge).gainRampRemainingFrameCount > 0 {
+        while true {
+            guard routeIsActive(bridge: bridge, outputRenderer: outputRenderer) else {
+                throw AudioRouteProbeError.routeLifecycleChanged
+            }
+            guard AOAudioBridgeRead(bridge).gainRampRemainingFrameCount > 0 else {
+                return
+            }
             guard clock.now < deadline else {
                 throw AudioRouteProbeError.gainRampTimedOut
             }
             try await Task.sleep(for: .milliseconds(2))
         }
+    }
+
+    private func routeIsActive(
+        bridge: OpaquePointer,
+        outputRenderer: PhysicalOutputRenderer
+    ) -> Bool {
+        self.bridge == bridge
+            && self.outputRenderer === outputRenderer
+            && isRunning
     }
 
     private func validateTapFormat(_ format: AudioStreamBasicDescription) throws {

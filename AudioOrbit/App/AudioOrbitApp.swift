@@ -130,7 +130,7 @@ private final class AudioOrbitStatusItemController: NSObject {
     }
 
     @objc private func quitApplication() {
-        model.quit()
+        Task { await model.quit() }
     }
 
     private func updateIcon() {

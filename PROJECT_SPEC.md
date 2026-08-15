@@ -684,7 +684,7 @@ Test on the minimum OS and the latest supported macOS release with:
 
 Automated tests must not assume particular hardware names or UIDs.
 
-The current automated suite contains 55 passing tests. Checked items above mean deterministic coverage exists in this repository; unchecked hardware and failure-injection items remain required even when related behavior has been exercised manually.
+The current automated suite contains 58 passing tests. Checked items above mean deterministic coverage exists in this repository; unchecked hardware and failure-injection items remain required even when related behavior has been exercised manually.
 
 ## 22. Milestones
 

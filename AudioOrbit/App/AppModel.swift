@@ -27,6 +27,11 @@ final class AppModel: ObservableObject {
     @Published private(set) var supportReportExportMessage: String?
     @Published private(set) var hasCompletedOnboarding: Bool
 
+    private enum CleanupCompletion: Sendable {
+        case remove(preserveAutomaticMode: Bool)
+        case waitForDestination
+    }
+
     private final class RouteSession {
         let id = UUID()
         let sourcePID: pid_t
@@ -49,6 +54,9 @@ final class AppModel: ObservableObject {
         var healthAnalyzer = AudioHealthAnalyzer()
         var metricsTask: Task<Void, Never>?
         var reconnectTask: Task<Void, Never>?
+        var switchTask: Task<Void, Error>?
+        var cleanupRetryTask: Task<Void, Never>?
+        var cleanupCompletion: CleanupCompletion?
         let probe = ProcessTapProbe()
 
         init(
@@ -91,6 +99,7 @@ final class AppModel: ObservableObject {
     private static let healthWarmUp = Duration.seconds(3)
     private static let displayChangeDwell = Duration.milliseconds(500)
     private static let noEligibleWindowGrace = Duration.seconds(1)
+    private static let cleanupRetryDelay = Duration.seconds(1)
 
     private let discovery = AudioDiscovery()
     private let deviceMonitor = AudioDeviceMonitor()
@@ -590,34 +599,137 @@ final class AppModel: ObservableObject {
             publishRoutes()
         } catch {
             diagnostics.record("start-failed", category: "route", level: .error)
-            sessions.removeValue(forKey: session.id)
-            routeOrder.removeAll { $0 == session.id }
-            lastError = String(describing: error)
+            if session.probe.requiresCleanup {
+                session.state = .failed
+                session.notice = cleanupRetryNotice(for: session)
+                session.error = String(describing: error)
+                session.cleanupCompletion = .remove(preserveAutomaticMode: false)
+                scheduleCleanupRetry(for: session.id)
+                lastError = "AudioOrbit could not finish restoring normal playback for \(source.name)."
+            } else {
+                sessions.removeValue(forKey: session.id)
+                routeOrder.removeAll { $0 == session.id }
+                lastError = String(describing: error)
+            }
             chooseSuggestedInputs()
             publishRoutes()
         }
     }
 
     func stopRoute(_ routeID: UUID, preserveAutomaticMode: Bool = false) async {
+        await cleanUpRoute(
+            routeID,
+            completion: .remove(preserveAutomaticMode: preserveAutomaticMode)
+        )
+    }
+
+    func retryRouteCleanup(_ routeID: UUID) async {
+        guard let session = sessions[routeID],
+              let completion = session.cleanupCompletion else { return }
+        session.cleanupRetryTask?.cancel()
+        session.cleanupRetryTask = nil
+        await cleanUpRoute(routeID, completion: completion)
+    }
+
+    private func cleanUpRoute(
+        _ routeID: UUID,
+        completion: CleanupCompletion
+    ) async {
         guard let session = sessions[routeID] else { return }
         diagnostics.markRouteTransition()
         diagnostics.record("stop-requested", category: "route")
-        let wasAutomaticRoute = session.isAutomatic
-        session.state = .stopping
+        session.cleanupCompletion = completion
+        session.cleanupRetryTask?.cancel()
+        session.cleanupRetryTask = nil
         session.metricsTask?.cancel()
         session.metricsTask = nil
         session.reconnectTask?.cancel()
         session.reconnectTask = nil
+        session.state = .stopping
+        session.notice = "Restoring normal playback…"
+        session.error = nil
         publishRoutes()
 
-        if session.probe.isRunning {
-            do {
+        if let switchTask = session.switchTask {
+            switchTask.cancel()
+            _ = await switchTask.result
+            session.switchTask = nil
+        }
+        guard let currentSession = sessions[routeID],
+              currentSession === session else { return }
+
+        do {
+            if session.probe.requiresCleanup {
                 try session.probe.stop()
-            } catch {
-                lastError = "The route was removed, but Core Audio reported a cleanup issue: \(error)"
             }
+        } catch {
+            if session.probe.requiresCleanup {
+                session.state = .failed
+                session.notice = cleanupRetryNotice(for: session)
+                session.error = String(describing: error)
+                diagnostics.record(
+                    "cleanup-retry-required",
+                    category: "route",
+                    level: .error
+                )
+                lastError = session.probe.isNormalPlaybackRestored
+                    ? "Normal playback is restored for \(session.sourceName), but AudioOrbit is retrying final Core Audio cleanup."
+                    : "AudioOrbit could not confirm normal playback for \(session.sourceName). Keep AudioOrbit running while cleanup retries."
+                scheduleCleanupRetry(for: routeID)
+                updateWatchedDeviceIDs()
+                publishRoutes()
+                return
+            }
+            // The muting tap is gone, so pass-through is restored even if an
+            // unrelated renderer/HAL cleanup operation reported an error.
+            lastError = "Normal playback was restored, but Core Audio reported a cleanup issue: \(error)"
         }
 
+        session.cleanupCompletion = nil
+        switch completion {
+        case .waitForDestination:
+            session.metrics = TapProbeMetrics()
+            session.health = AudioRouteHealth()
+            session.state = .waitingForDestination
+            session.notice = "\(session.destinationName) disconnected. Normal playback is restored while AudioOrbit waits for it to return."
+            diagnostics.record("safe-pass-through-ready", category: "route")
+            updateWatchedDeviceIDs()
+            publishRoutes()
+        case .remove(let preserveAutomaticMode):
+            await removeCleanedRoute(
+                routeID,
+                session: session,
+                preserveAutomaticMode: preserveAutomaticMode
+            )
+        }
+    }
+
+    private func scheduleCleanupRetry(for routeID: UUID) {
+        guard let session = sessions[routeID],
+              session.cleanupCompletion != nil else { return }
+        session.cleanupRetryTask?.cancel()
+        session.cleanupRetryTask = Task { [weak self] in
+            try? await Task.sleep(for: Self.cleanupRetryDelay)
+            guard !Task.isCancelled, let self,
+                  let current = self.sessions[routeID],
+                  let completion = current.cleanupCompletion else { return }
+            current.cleanupRetryTask = nil
+            await self.cleanUpRoute(routeID, completion: completion)
+        }
+    }
+
+    private func cleanupRetryNotice(for session: RouteSession) -> String {
+        session.probe.isNormalPlaybackRestored
+            ? "Normal playback is restored. AudioOrbit will retry final Core Audio cleanup."
+            : "Normal playback could not be confirmed. AudioOrbit will retry cleanup."
+    }
+
+    private func removeCleanedRoute(
+        _ routeID: UUID,
+        session: RouteSession,
+        preserveAutomaticMode: Bool
+    ) async {
+        let wasAutomaticRoute = session.isAutomatic
         sessions.removeValue(forKey: routeID)
         diagnostics.record("stop-completed", category: "route")
         routeOrder.removeAll { $0 == routeID }
@@ -657,8 +769,19 @@ final class AppModel: ObservableObject {
         session.error = nil
         publishRoutes()
 
-        do {
+        let switchTask = Task {
             try await session.probe.switchDestination(to: destinationDeviceID)
+        }
+        session.switchTask = switchTask
+        defer {
+            session.switchTask = nil
+        }
+
+        do {
+            try await switchTask.value
+            guard let currentSession = sessions[routeID],
+                  currentSession === session,
+                  session.state == .switching else { return }
             session.destinationDeviceID = destination.id
             session.destinationUID = destination.uid
             session.destinationName = destination.name
@@ -669,9 +792,12 @@ final class AppModel: ObservableObject {
             }
             startMetricsSampling(for: routeID)
         } catch {
+            guard let currentSession = sessions[routeID],
+                  currentSession === session,
+                  session.state == .switching else { return }
             diagnostics.record("switch-failed", category: "route", level: .error)
             session.error = String(describing: error)
-            if session.probe.isRunning {
+            if session.probe.hasActiveRoute {
                 session.state = .running
                 startMetricsSampling(for: routeID)
             } else {
@@ -679,19 +805,33 @@ final class AppModel: ObservableObject {
                 session.health = AudioRouteHealth()
                 session.notice = "Normal playback was restored for \(session.sourceName)."
                 session.state = .failed
+                if session.probe.requiresCleanup {
+                    session.cleanupCompletion = .remove(
+                        preserveAutomaticMode: session.isAutomatic
+                    )
+                    session.notice = cleanupRetryNotice(for: session)
+                    scheduleCleanupRetry(for: routeID)
+                }
             }
         }
         updateWatchedDeviceIDs()
         publishRoutes()
     }
 
-    func quit() {
+    func quit() async {
         diagnostics.record("quit-requested", category: "application")
         hardwareRefreshTask?.cancel()
         cancelAutomaticDecisions()
         for session in sessions.values {
             session.metricsTask?.cancel()
             session.reconnectTask?.cancel()
+            session.cleanupRetryTask?.cancel()
+            session.state = .stopping
+            if let switchTask = session.switchTask {
+                switchTask.cancel()
+                _ = await switchTask.result
+                session.switchTask = nil
+            }
             try? session.probe.stop()
         }
         sessions.removeAll()
@@ -1061,9 +1201,15 @@ final class AppModel: ObservableObject {
 
             if let routeID = automaticRouteIDs[source.pid],
                let session = sessions[routeID] {
-                if session.state != .running {
+                switch RouteLifecyclePolicy.reconciliationAction(
+                    for: session.state,
+                    requiresCleanupRetry: session.cleanupCompletion != nil
+                ) {
+                case .retryAfterTransition:
+                    continue
+                case .replaceRoute:
                     await stopRoute(routeID, preserveAutomaticMode: true)
-                } else {
+                case .useRunningRoute:
                     if session.destinationUID != destination.uid {
                         await switchRoute(
                             routeID,
@@ -1223,9 +1369,23 @@ final class AppModel: ObservableObject {
 
         if let routeID = automaticRouteIDs[sourcePID],
            let session = sessions[routeID] {
-            if session.state != .running {
+            switch RouteLifecyclePolicy.reconciliationAction(
+                for: session.state,
+                requiresCleanupRetry: session.cleanupCompletion != nil
+            ) {
+            case .retryAfterTransition:
+                state.hasCandidate = false
+                scheduleAutomaticRouteDecision(
+                    for: source,
+                    association: association,
+                    evidence: state.evidence,
+                    force: true,
+                    requestedDelay: .milliseconds(250)
+                )
+                return
+            case .replaceRoute:
                 await stopRoute(routeID, preserveAutomaticMode: true)
-            } else if session.destinationUID != destination.uid {
+            case .useRunningRoute where session.destinationUID != destination.uid:
                 await switchRoute(routeID, to: destination.id)
                 if session.destinationUID == destination.uid {
                     session.followedDisplayUUID = display.id
@@ -1238,7 +1398,7 @@ final class AppModel: ObservableObject {
                 publishRoutes()
                 updateAutomaticRoutingSummary()
                 return
-            } else {
+            case .useRunningRoute:
                 session.followedDisplayUUID = display.id
                 session.followedDisplayName = display.name
                 session.notice = "Following \(display.name)."
@@ -1313,10 +1473,19 @@ final class AppModel: ObservableObject {
             chooseSuggestedInputs()
             publishRoutes()
         } catch {
-            sessions.removeValue(forKey: session.id)
-            routeOrder.removeAll { $0 == session.id }
-            automaticRouteIDs.removeValue(forKey: source.pid)
-            lastError = String(describing: error)
+            if session.probe.requiresCleanup {
+                session.state = .failed
+                session.notice = cleanupRetryNotice(for: session)
+                session.error = String(describing: error)
+                session.cleanupCompletion = .remove(preserveAutomaticMode: true)
+                scheduleCleanupRetry(for: session.id)
+                lastError = "AudioOrbit could not finish restoring normal playback for \(displayedSourceName)."
+            } else {
+                sessions.removeValue(forKey: session.id)
+                routeOrder.removeAll { $0 == session.id }
+                automaticRouteIDs.removeValue(forKey: source.pid)
+                lastError = String(describing: error)
+            }
             chooseSuggestedInputs()
             publishRoutes()
         }
@@ -1463,32 +1632,14 @@ final class AppModel: ObservableObject {
     }
 
     private func enterSafeRecovery(for routeID: UUID) async {
-        guard let session = sessions[routeID], session.state == .running else { return }
+        guard sessions[routeID]?.state == .running else { return }
         diagnostics.markRouteTransition()
         diagnostics.record(
             "safe-pass-through-entered",
             category: "route",
             level: .warning
         )
-        session.state = .stopping
-        session.metricsTask?.cancel()
-        session.metricsTask = nil
-        session.reconnectTask?.cancel()
-        session.reconnectTask = nil
-        publishRoutes()
-
-        do {
-            try session.probe.stop()
-        } catch {
-            session.error = "The route was removed, but Core Audio reported a cleanup issue: \(error)"
-        }
-
-        session.metrics = TapProbeMetrics()
-        session.health = AudioRouteHealth()
-        session.state = .waitingForDestination
-        session.notice = "\(session.destinationName) disconnected. AudioOrbit restored \(session.sourceName) to normal playback and will reconnect only when that output returns."
-        updateWatchedDeviceIDs()
-        publishRoutes()
+        await cleanUpRoute(routeID, completion: .waitForDestination)
     }
 
     private func beginReconnectDwell(for routeID: UUID) {
@@ -1538,8 +1689,14 @@ final class AppModel: ObservableObject {
             startMetricsSampling(for: routeID)
         } catch {
             session.state = .failed
-            session.notice = "Normal playback remains in place."
             session.error = "AudioOrbit could not restore this route: \(error)"
+            if session.probe.requiresCleanup {
+                session.cleanupCompletion = .waitForDestination
+                session.notice = cleanupRetryNotice(for: session)
+                scheduleCleanupRetry(for: routeID)
+            } else {
+                session.notice = "Normal playback remains in place."
+            }
         }
         updateWatchedDeviceIDs()
         publishRoutes()
@@ -1628,7 +1785,8 @@ final class AppModel: ObservableObject {
                 metrics: session.metrics,
                 health: session.health,
                 notice: session.notice,
-                error: session.error
+                error: session.error,
+                requiresCleanupRetry: session.cleanupCompletion != nil
             )
         }
         let liveBundles = Set(liveRoutes.compactMap {

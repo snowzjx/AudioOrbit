@@ -119,6 +119,17 @@ struct MenuBarView: View {
                     .lineLimit(2)
             }
             Spacer()
+            if route.requiresCleanupRetry {
+                Button {
+                    Task { await model.retryRouteCleanup(route.id) }
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.orange)
+                .help("Retry restoring normal playback")
+                .accessibilityLabel("Retry cleanup for \(route.sourceName)")
+            }
             Button(role: .destructive) {
                 Task { await model.ignoreRoute(route.id) }
             } label: {
@@ -227,7 +238,9 @@ struct MenuBarView: View {
             }
             .buttonStyle(.bordered)
             Spacer()
-            Button("Quit AudioOrbit") { model.quit() }
+            Button("Quit AudioOrbit") {
+                Task { await model.quit() }
+            }
                 .buttonStyle(.bordered)
         }
     }

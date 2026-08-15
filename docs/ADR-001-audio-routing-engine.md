@@ -61,6 +61,9 @@ Headphone Override is a temporary policy overlay. It switches live routes to one
 ## Failure behavior
 
 - A partial setup failure destroys created objects in reverse order and leaves or restores pass-through.
+- Stop and quit cancel and await any in-flight destination switch before teardown; the probe also revalidates callback-object identity after every suspension point.
+- HAL object IDs and callback contexts are retained when destruction fails. The route stays visible, retries cleanup automatically, and offers a manual retry until cleanup completes.
+- Automatic reconciliation treats starting, switching, stopping and reconnecting routes as busy; it retries the decision instead of replacing an in-flight route.
 - A normal mapped-output disconnect releases the affected muting tap and preserves the destination UID for same-device recovery.
 - A Headphone Override disconnect is a clean policy handoff, not a missing-device warning.
 - Global disable and normal quit stop every active session.

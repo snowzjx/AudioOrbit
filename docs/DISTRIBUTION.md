@@ -31,7 +31,7 @@ xcrun notarytool store-credentials AudioOrbit-Notary \
 From the repository root:
 
 ```sh
-AUDIOORBIT_VERSION=0.2.0 scripts/build-release.sh
+AUDIOORBIT_VERSION=0.2.1 scripts/build-release.sh
 scripts/notarize-release.sh
 ```
 
@@ -75,8 +75,8 @@ Securely delete temporary certificate exports when they are no longer needed. Ke
 After the release commit is on the intended branch, create and push a semantic version tag:
 
 ```sh
-git tag -a v0.2.0 -m "AudioOrbit 0.2.0"
-git push origin v0.2.0
+git tag -a v0.2.1 -m "AudioOrbit 0.2.1"
+git push origin v0.2.1
 ```
 
 The tagged workflow runs all tests, archives and signs the app, submits it to Apple, prints the notarization log on rejection, staples the accepted ticket, runs Gatekeeper verification and creates the GitHub Release with the final ZIP and checksum.

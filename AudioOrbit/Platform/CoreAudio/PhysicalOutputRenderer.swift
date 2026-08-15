@@ -6,6 +6,8 @@ final class PhysicalOutputRenderer {
     private var audioUnit: AudioUnit?
     private(set) var isStarted = false
 
+    var requiresCleanup: Bool { audioUnit != nil }
+
     func prepare(
         deviceID: AudioObjectID,
         clientFormat: AudioStreamBasicDescription,
@@ -124,8 +126,9 @@ final class PhysicalOutputRenderer {
                     operation: "Stop the selected-device renderer",
                     status: status
                 )
+            } else {
+                isStarted = false
             }
-            isStarted = false
         }
 
         if let audioUnit {
@@ -143,7 +146,13 @@ final class PhysicalOutputRenderer {
                     status: disposeStatus
                 )
             }
-            self.audioUnit = nil
+            // Keep the unit and its callback context alive when disposal fails.
+            // A later stop attempt can safely retry instead of allowing the
+            // bridge referenced by the callback to be freed underneath it.
+            if disposeStatus == noErr {
+                self.audioUnit = nil
+                isStarted = false
+            }
         }
 
         if let firstError { throw firstError }

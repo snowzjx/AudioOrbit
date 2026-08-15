@@ -4,7 +4,7 @@
 **Target:** Native macOS menu-bar application
 **Minimum OS:** macOS 14.2
 **Primary language/UI:** Swift and SwiftUI, with Core Audio interop where required
-**Last updated:** 2026-08-13
+**Last updated:** 2026-08-15
 
 ## 1. Product summary
 

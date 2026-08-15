@@ -97,6 +97,8 @@ final class AppModel: ObservableObject {
         var mediaAnchorMissTickCount = 0
         var pendingMediaAnchorID: String?
         var anchoredWebViewProcessID: pid_t?
+        var anchoredPIDMissingTickCount = 0
+        var manualAnchorOverride = false
     }
 
     private static let hardwareChangeCoalescingDelay = Duration.milliseconds(100)
@@ -110,6 +112,7 @@ final class AppModel: ObservableObject {
     private static let mediaAnchorDwellTicks = 3
     private static let mediaAnchorMissToleranceTicks = 3
     private static let freshMediaWindowAgeTicks = 12
+    private static let anchoredPIDMissingToleranceTicks = 6
 
     private let discovery = AudioDiscovery()
     private let deviceMonitor = AudioDeviceMonitor()
@@ -293,9 +296,19 @@ final class AppModel: ObservableObject {
               let state = automaticTracking[session.sourcePID],
               let focusedID = state.evidence?.focusedWindowIdentifier,
               focusedID != state.committedWindowIdentifier else { return }
+        // A manual pin is authoritative: suppress automatic anchor
+        // following until the playback session restarts, otherwise the
+        // media-indicator rule would immediately pull the anchor back to
+        // the media window and the audio would snap back.
         state.committedWindowIdentifier = focusedID
         state.anchorMissTickCount = 0
         state.mediaAnchorDwellTickCount = 0
+        state.mediaAnchorMissTickCount = 0
+        state.pendingMediaAnchorID = nil
+        state.manualAnchorOverride = true
+        state.anchoredWebViewProcessID = state.evidence?
+            .webViewProcessIDsByWindow[focusedID]
+            ?? state.anchoredWebViewProcessID
         diagnostics.record("playback-anchor-manual-repin", category: "routing")
         await refreshAutomaticWindowEvidence(forceImmediate: true)
     }
@@ -1171,6 +1184,8 @@ final class AppModel: ObservableObject {
                     state.anchorMissTickCount = 0
                     state.mediaAnchorDwellTickCount = 0
                     state.anchoredWebViewProcessID = nil
+                    state.anchoredPIDMissingTickCount = 0
+                    state.manualAnchorOverride = false
                     diagnostics.record(
                         "playback-session-detected",
                         category: "routing"
@@ -1380,15 +1395,38 @@ final class AppModel: ObservableObject {
                 }
             }
             let targetID: String?
-            if source.isRunningOutput,
+            if state.manualAnchorOverride {
+                // The user pinned this window manually; automatic
+                // following stays suppressed until the playback session
+                // restarts or the pinned window disappears.
+                targetID = nil
+            } else if source.isRunningOutput,
                let anchoredPID = state.anchoredWebViewProcessID {
+                // The renderer pid is the authoritative signal. Safari's
+                // audio indicator follows the focused window, not the
+                // playing one, so the media heuristic must never override
+                // a renderer that is still reported in the anchor window.
                 let windowsWithPID = pidMap.filter { $0.value == anchoredPID }
                     .map(\.key)
                 if windowsWithPID.count == 1,
                    windowsWithPID[0] != state.committedWindowIdentifier {
+                    state.anchoredPIDMissingTickCount = 0
                     targetID = windowsWithPID[0]
+                } else if state.committedWindowIdentifier.map({ windowsWithPID.contains($0) }) ?? false {
+                    // The playing tab is still in the anchor window.
+                    state.anchoredPIDMissingTickCount = 0
+                    targetID = nil
                 } else {
-                    targetID = Self.bestMediaTarget(mediaIdentifiers, ages: ages)
+                    // The renderer is not reported anywhere this tick.
+                    // Tolerate transient Accessibility gaps before falling
+                    // back, so a short hiccup cannot yank the audio.
+                    state.anchoredPIDMissingTickCount += 1
+                    if state.anchoredPIDMissingTickCount
+                        >= Self.anchoredPIDMissingToleranceTicks {
+                        targetID = Self.bestMediaTarget(mediaIdentifiers, ages: ages)
+                    } else {
+                        targetID = nil
+                    }
                 }
             } else {
                 targetID = Self.bestMediaTarget(mediaIdentifiers, ages: ages)
@@ -1453,6 +1491,7 @@ final class AppModel: ObservableObject {
                 if state.anchorMissTickCount >= Self.anchorStalenessTicks {
                     state.anchorMissTickCount = 0
                     state.committedWindowIdentifier = nil
+                    state.manualAnchorOverride = false
                     diagnostics.record(
                         "playback-anchor-repinned",
                         category: "routing"

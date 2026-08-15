@@ -137,6 +137,10 @@ struct AudioOrbitSettingsView: View {
                     )
                 ) {
                     Text("Choose headphones").tag(String?.none)
+                    if let uid = model.headphoneOverrideDeviceUID,
+                       !model.devices.contains(where: { $0.uid == uid }) {
+                        Text("Previously selected output — unavailable").tag(Optional(uid))
+                    }
                     ForEach(model.devices) { device in
                         Text(device.name).tag(Optional(device.uid))
                     }

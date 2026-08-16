@@ -156,12 +156,17 @@ jobs:
           # silently delete 'x', '2' and '7' from the key.)
           printf '%s' "$SPARKLE_EDDSA_KEY" | tr -d '[:space:]"\047' > "$KEY_FILE"
           echo "Sparkle EdDSA key length: $(wc -c < "$KEY_FILE") bytes (expected 44)"
+          # generate_appcast takes a DIRECTORY of release archives, not a
+          # single zip path; stage the zip in its own directory.
+          APPCAST_INPUT="$RUNNER_TEMP/appcast-input"
+          mkdir -p "$APPCAST_INPUT"
+          cp build/AudioOrbit.zip "$APPCAST_INPUT/"
           run_appcast() {
             "$RUNNER_TEMP/sparkle/bin/generate_appcast" \
               --ed-key-file "$KEY_FILE" \
               --download-url-prefix "https://github.com/snowzjx/AudioOrbit/releases/download/$GITHUB_REF_NAME" \
               -o "$RUNNER_TEMP/appcast.xml" \
-              build/AudioOrbit.zip
+              "$APPCAST_INPUT"
           }
           if ! run_appcast; then
             # Tolerate a secret that was accidentally base64-wrapped: decode

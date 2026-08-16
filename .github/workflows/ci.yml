@@ -148,7 +148,11 @@ jobs:
           # The secret holds the base64 EdDSA key string exported from the
           # macOS keychain: security find-generic-password -a ed25519 -w
           KEY_FILE="$RUNNER_TEMP/sparkle-eddsa-key"
-          printf '%s' "$SPARKLE_EDDSA_KEY" > "$KEY_FILE"
+          # Strip accidental whitespace or surrounding quotes; the key must be
+          # exactly 44 base64 characters. Length diagnostics keep future
+          # misformatted secrets debuggable without printing key material.
+          printf '%s' "$SPARKLE_EDDSA_KEY" | tr -d '[:space:]"\x27' > "$KEY_FILE"
+          echo "Sparkle EdDSA key length: $(wc -c < "$KEY_FILE") bytes (expected 44)"
           run_appcast() {
             "$RUNNER_TEMP/sparkle/bin/generate_appcast" \
               --ed-key-file "$KEY_FILE" \

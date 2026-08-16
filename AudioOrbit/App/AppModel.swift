@@ -100,6 +100,8 @@ final class AppModel: ObservableObject {
         var anchoredPIDMissingTickCount = 0
         var manualAnchorOverride = false
         var forceImmediateDecision = false
+        var pendingSessionRelease = false
+        var suppressAnchorAdoptionThisTick = false
     }
 
     private static let hardwareChangeCoalescingDelay = Duration.milliseconds(100)
@@ -1172,6 +1174,11 @@ final class AppModel: ObservableObject {
             // so the audio never falls back mid-transition.
             if let replacement = replacementSource(forVanishedPID: pid),
                let trackedState {
+                // Mark the migrated state as still running so the
+                // session-boundary detection below does not treat the
+                // replacement as a brand-new playback session and
+                // release the anchor mid-transition.
+                trackedState.wasRunningOutput = true
                 automaticTracking[replacement.pid] = trackedState
                 await migrateAutomaticRoute(fromPID: pid, to: replacement)
             } else {
@@ -1192,16 +1199,11 @@ final class AppModel: ObservableObject {
                     silenceTicks: state.silentTickCount,
                     requiredSilenceTicks: Self.playbackSessionSilenceTicks
                 ) {
-                    state.committedWindowIdentifier = nil
-                    state.anchorMissTickCount = 0
-                    state.mediaAnchorDwellTickCount = 0
-                    state.anchoredWebViewProcessID = nil
-                    state.anchoredPIDMissingTickCount = 0
-                    state.manualAnchorOverride = false
-                    diagnostics.record(
-                        "playback-session-detected",
-                        category: "routing"
-                    )
+                    // Defer the anchor release until this tick's evidence
+                    // is available: a pause/resume of the same tab keeps
+                    // its renderer in the anchor window and must NOT count
+                    // as a new playback session.
+                    state.pendingSessionRelease = true
                 }
                 state.silentTickCount = 0
             } else {
@@ -1387,6 +1389,38 @@ final class AppModel: ObservableObject {
             let ownerPID = association.windowOwner.pid
             let mediaIdentifiers = Set(evidence.mediaPlayingWindowIdentifiers)
             let pidMap = evidence.webViewProcessIDsByWindow
+            if state.pendingSessionRelease {
+                state.pendingSessionRelease = false
+                let sameTabResumed: Bool
+                if let anchorID = state.committedWindowIdentifier,
+                   let anchoredPID = state.anchoredWebViewProcessID,
+                   pidMap[anchorID] == anchoredPID {
+                    sameTabResumed = true
+                } else {
+                    sameTabResumed = false
+                }
+                if sameTabResumed {
+                    diagnostics.record(
+                        "playback-resume-kept-anchor",
+                        category: "routing"
+                    )
+                } else {
+                    state.committedWindowIdentifier = nil
+                    state.anchorMissTickCount = 0
+                    state.mediaAnchorDwellTickCount = 0
+                    state.mediaAnchorMissTickCount = 0
+                    state.pendingMediaAnchorID = nil
+                    state.anchoredWebViewProcessID = nil
+                    state.anchoredPIDMissingTickCount = 0
+                    state.manualAnchorOverride = false
+                    state.forceImmediateDecision = false
+                    state.suppressAnchorAdoptionThisTick = true
+                    diagnostics.record(
+                        "playback-session-detected",
+                        category: "routing"
+                    )
+                }
+            }
             let currentIDs = Set(evidence.candidateWindowIdentifiers)
             var ages = windowIdentifierAges[ownerPID] ?? [:]
             for identifier in currentIDs {
@@ -1412,7 +1446,6 @@ final class AppModel: ObservableObject {
                 }
             }
             let targetID: String?
-            var pidDerivedTarget = false
             if state.manualAnchorOverride {
                 // The user pinned this window manually; automatic
                 // following stays suppressed until the playback session
@@ -1426,12 +1459,31 @@ final class AppModel: ObservableObject {
                 // a renderer that is still reported in the anchor window.
                 let windowsWithPID = pidMap.filter { $0.value == anchoredPID }
                     .map(\.key)
+                let anchorID = state.committedWindowIdentifier
                 if windowsWithPID.count == 1,
-                   windowsWithPID[0] != state.committedWindowIdentifier {
+                   windowsWithPID[0] != anchorID {
+                    // The playing tab is now in a different window.
                     state.anchoredPIDMissingTickCount = 0
                     targetID = windowsWithPID[0]
-                    pidDerivedTarget = true
-                } else if state.committedWindowIdentifier.map({ windowsWithPID.contains($0) }) ?? false {
+                } else if let anchorID,
+                          windowsWithPID.count == 2,
+                          let other = windowsWithPID.first(where: { $0 != anchorID }) {
+                    // Both the anchor window and another window report the
+                    // renderer. After a tab tear-off the anchor's BrowserView
+                    // entry stays stale until its active tab navigates. A
+                    // freshly created reporting window is the torn-off
+                    // destination, so let freshness arbitrate instead of
+                    // waiting for the user to navigate the anchor window.
+                    let otherAge = ages[other] ?? 0
+                    let anchorAge = ages[anchorID] ?? 0
+                    state.anchoredPIDMissingTickCount = 0
+                    if otherAge <= Self.freshMediaWindowAgeTicks,
+                       otherAge < anchorAge {
+                        targetID = other
+                    } else {
+                        targetID = nil
+                    }
+                } else if anchorID.map({ windowsWithPID.contains($0) }) ?? false {
                     // The playing tab is still in the anchor window.
                     state.anchoredPIDMissingTickCount = 0
                     targetID = nil
@@ -1451,13 +1503,21 @@ final class AppModel: ObservableObject {
                     if state.anchoredPIDMissingTickCount
                         >= Self.anchoredPIDMissingToleranceTicks,
                        !anchorInvisible {
-                        targetID = Self.bestMediaTarget(mediaIdentifiers, ages: ages)
+                        targetID = WindowRouteAffinityPolicy.bestMediaTarget(
+                            mediaIdentifiers,
+                            ages: ages,
+                            freshWindowAgeTicks: Self.freshMediaWindowAgeTicks
+                        )
                     } else {
                         targetID = nil
                     }
                 }
             } else {
-                targetID = Self.bestMediaTarget(mediaIdentifiers, ages: ages)
+                targetID = WindowRouteAffinityPolicy.bestMediaTarget(
+                    mediaIdentifiers,
+                    ages: ages,
+                    freshWindowAgeTicks: Self.freshMediaWindowAgeTicks
+                )
             }
             if source.isRunningOutput,
                let targetID,
@@ -1472,13 +1532,11 @@ final class AppModel: ObservableObject {
                     state.mediaAnchorDwellTickCount = 1
                 }
                 state.mediaAnchorMissTickCount = 0
-                // A renderer-identity target is deterministic: one
-                // confirming tick is enough. Indicator-derived targets
-                // keep the longer dwell because the signal is noisier.
-                let requiredDwell = pidDerivedTarget
-                    ? 1
-                    : Self.mediaAnchorDwellTicks
-                if state.mediaAnchorDwellTickCount >= requiredDwell {
+                // The same window must hold the target for the whole
+                // dwell. During tab transitions Safari can transiently
+                // report the renderer in either window, and a shorter
+                // dwell made the anchor follow every flicker.
+                if state.mediaAnchorDwellTickCount >= Self.mediaAnchorDwellTicks {
                     state.mediaAnchorDwellTickCount = 0
                     state.mediaAnchorMissTickCount = 0
                     state.pendingMediaAnchorID = nil
@@ -1539,11 +1597,18 @@ final class AppModel: ObservableObject {
             } else {
                 state.anchorMissTickCount = 0
             }
-            state.committedWindowIdentifier = WindowRouteAffinityPolicy.routeAnchor(
-                existing: state.committedWindowIdentifier,
-                selected: evidence?.selectedWindowIdentifier,
-                associationReason: association.reason
-            )
+            if state.suppressAnchorAdoptionThisTick {
+                // A deferred session release must not adopt this tick's
+                // selection, which was computed against the stale anchor;
+                // the next tick re-selects from scratch.
+                state.suppressAnchorAdoptionThisTick = false
+            } else {
+                state.committedWindowIdentifier = WindowRouteAffinityPolicy.routeAnchor(
+                    existing: state.committedWindowIdentifier,
+                    selected: evidence?.selectedWindowIdentifier,
+                    associationReason: association.reason
+                )
+            }
         }
         let candidateDisplayUUID = evidence?.displayUUID
 
@@ -1724,26 +1789,6 @@ final class AppModel: ObservableObject {
             displayName: display.name,
             destination: destination
         )
-    }
-
-    /// Chooses the media window to follow. A single media window is the
-    /// obvious target. With several, the freshest one wins: a torn-off tab
-    /// lands in a freshly created window whose identifier age is small,
-    /// while the source window's stale indicator keeps a large age. Old
-    /// simultaneous playback stays ambiguous and is left alone.
-    private static func bestMediaTarget(
-        _ mediaIdentifiers: Set<String>,
-        ages: [String: Int]
-    ) -> String? {
-        if mediaIdentifiers.count == 1 {
-            return mediaIdentifiers.first
-        }
-        guard mediaIdentifiers.count > 1 else { return nil }
-        let minimumAge = mediaIdentifiers.map { ages[$0] ?? 0 }.min() ?? 0
-        let freshest = mediaIdentifiers.filter { (ages[$0] ?? 0) == minimumAge }
-        guard freshest.count == 1,
-              minimumAge <= Self.freshMediaWindowAgeTicks else { return nil }
-        return freshest.first
     }
 
     /// True when the anchored window is currently invisible and no

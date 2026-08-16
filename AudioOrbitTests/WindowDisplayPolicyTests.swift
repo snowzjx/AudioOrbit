@@ -132,6 +132,57 @@ final class WindowDisplayPolicyTests: XCTestCase {
         ))
     }
 
+    func testMediaTargetPrefersUniqueWindowThenFreshest() {
+        XCTAssertEqual(
+            WindowRouteAffinityPolicy.bestMediaTarget(["a"], ages: ["a": 5], freshWindowAgeTicks: 12),
+            "a"
+        )
+        XCTAssertEqual(
+            WindowRouteAffinityPolicy.bestMediaTarget(
+                ["old", "fresh"],
+                ages: ["old": 100, "fresh": 3],
+                freshWindowAgeTicks: 12
+            ),
+            "fresh"
+        )
+        XCTAssertNil(
+            WindowRouteAffinityPolicy.bestMediaTarget(
+                ["old1", "old2"],
+                ages: ["old1": 100, "old2": 101],
+                freshWindowAgeTicks: 12
+            )
+        )
+        XCTAssertNil(
+            WindowRouteAffinityPolicy.bestMediaTarget(
+                ["x", "y"],
+                ages: ["x": 2, "y": 2],
+                freshWindowAgeTicks: 12
+            )
+        )
+        XCTAssertNil(
+            WindowRouteAffinityPolicy.bestMediaTarget([], ages: [:], freshWindowAgeTicks: 12)
+        )
+    }
+
+    func testSafariWindowIdentifierNormalizesToStableUUID() {
+        let secure = AccessibilityWindowDiscovery.stableAXIdentifier(
+            "SafariWindow?IsSecure=true&UUID=9F1E1A0F-249C-4FCC-930D-27702C2C5D5D"
+        )
+        let insecure = AccessibilityWindowDiscovery.stableAXIdentifier(
+            "SafariWindow?IsSecure=false&UUID=9F1E1A0F-249C-4FCC-930D-27702C2C5D5D"
+        )
+        XCTAssertEqual(secure, "9F1E1A0F-249C-4FCC-930D-27702C2C5D5D")
+        XCTAssertEqual(insecure, "9F1E1A0F-249C-4FCC-930D-27702C2C5D5D")
+        XCTAssertEqual(
+            AccessibilityWindowDiscovery.stableAXIdentifier(
+                "Mail.messageViewer.window.15"
+            ),
+            "Mail.messageViewer.window.15"
+        )
+        XCTAssertNil(AccessibilityWindowDiscovery.stableAXIdentifier("UUID="))
+        XCTAssertNil(AccessibilityWindowDiscovery.stableAXIdentifier(nil))
+    }
+
     func testLargestIntersectionWorksWithNegativeAndVerticallyStackedCoordinates() throws {
         let left = display("00000000-0000-0000-0000-000000000001", name: "Left", frame: .init(x: -1_000, y: 0, width: 1_000, height: 800))
         let main = display("00000000-0000-0000-0000-000000000002", name: "Main", frame: .init(x: 0, y: 0, width: 1_000, height: 800))

@@ -236,7 +236,9 @@ struct AccessibilityWindowDiscovery {
             && (subrole == nil || subrole == (kAXStandardWindowSubrole as String))
         let frame = CGRect(origin: position, size: size)
         let identifier = matchedSurfaceIdentifier
-            ?? stringAttribute(window, kAXIdentifierAttribute as CFString)
+            ?? Self.stableAXIdentifier(
+                stringAttribute(window, kAXIdentifierAttribute as CFString)
+            )
             ?? "ax:\(processPID):\(index)"
         return WindowCandidateSnapshot(
             stableIdentifier: identifier,
@@ -249,6 +251,18 @@ struct AccessibilityWindowDiscovery {
             hasMediaIndicator: mediaIndicatorFound(in: window, depth: 0),
             webViewProcessID: browserViewProcessID(in: window, depth: 0)
         )
+    }
+
+    /// Safari's window identifier embeds volatile page state before a
+    /// stable UUID (`SafariWindow?IsSecure=true&UUID=…`). Navigating the
+    /// active tab between http and https flips the IsSecure flag, which
+    /// used to change the window's identity and desynchronize the anchor.
+    /// Keep only the UUID when one is present.
+    static func stableAXIdentifier(_ raw: String?) -> String? {
+        guard let raw, !raw.isEmpty else { return nil }
+        guard let range = raw.range(of: "UUID=") else { return raw }
+        let uuid = raw[range.upperBound...]
+        return uuid.isEmpty ? nil : String(uuid)
     }
 
     /// Assigns each AX window a distinct Core Graphics surface by largest

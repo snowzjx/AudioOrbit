@@ -31,7 +31,7 @@ The production bundle identifier is `me.snowzjx.AudioOrbit`.
 
 Moving the selected window to another mapped display moves its audio after a short stable delay. Removing a route permanently ignores that application until **Settings → General → Allow Again** is selected.
 
-Safari media routes stay anchored to the window where playback began, so using another Safari window does not move established audio. Dragging the playing tab into another window — including tearing it off into a new window on another display — follows the audio to the destination window after a short dwell. Safari does not expose reliable public per-tab audio ownership, so simultaneous tabs or background autoplay can remain ambiguous.
+Safari media routes stay anchored to the window where playback began, so using another Safari window does not move established audio. Dragging the playing tab into another window — including tearing it off into a new window on another display — follows the audio to the destination window after a short dwell. Pausing and resuming the same video keeps the audio where it was. Safari does not expose reliable public per-tab audio ownership, so simultaneous tabs or background autoplay can remain ambiguous.
 
 ## Build and test
 
@@ -41,7 +41,7 @@ Open `AudioOrbit.xcodeproj` and run the **AudioOrbit** scheme with Xcode 26 or a
 xcodebuild -project AudioOrbit.xcodeproj -scheme AudioOrbit test
 ```
 
-The automated suite contains 58 tests.
+The automated suite contains 60 tests.
 
 ## Documentation
 

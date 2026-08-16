@@ -18,20 +18,29 @@ struct ProcessWindowAssociationResolver {
                 )
             },
             parentPID: parentPID(of:),
-            allowsSystemWebKitClientAssociation: isSystemWebKitMediaHelper(audioProcess)
+            allowsSystemWebKitClientAssociation:
+                isSystemWebKitHelper(audioProcess)
         )
     }
 
-    private func isSystemWebKitMediaHelper(_ audioProcess: AudioProcessSnapshot) -> Bool {
-        guard audioProcess.bundleIdentifier == "com.apple.WebKit.GPU",
-              let executableURL = NSRunningApplication(
-                  processIdentifier: audioProcess.pid
-              )?.executableURL else {
-            return false
+    /// Both the GPU media helper and the per-tab WebContent renderers can
+    /// produce Safari audio (the latter hosts WebRTC and WebAudio media).
+    /// Either is a valid client for the name-prefix association, which
+    /// remains conservative: only the longest unique regular-app prefix is
+    /// accepted. The running-app lookup can fail transiently while Safari
+    /// restarts helpers; the Apple-signed bundle identifier alone is then
+    /// enough to trust the process.
+    private func isSystemWebKitHelper(_ audioProcess: AudioProcessSnapshot) -> Bool {
+        guard audioProcess.bundleIdentifier == "com.apple.WebKit.GPU"
+                || audioProcess.bundleIdentifier == "com.apple.WebKit.WebContent"
+        else { return false }
+        guard let executableURL = NSRunningApplication(
+            processIdentifier: audioProcess.pid
+        )?.executableURL else {
+            return true
         }
         let path = executableURL.standardizedFileURL.path
         return path.contains("/System/Library/Frameworks/WebKit.framework/")
-            && path.hasSuffix("/com.apple.WebKit.GPU")
     }
 
     private func parentPID(of pid: pid_t) -> pid_t? {

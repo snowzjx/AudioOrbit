@@ -154,6 +154,27 @@ enum WindowRouteAffinityPolicy {
             && isRunningOutput
             && silenceTicks >= requiredSilenceTicks
     }
+
+    /// Chooses the media window to follow. A single media window is the
+    /// obvious target. With several, the freshest one wins: a torn-off tab
+    /// lands in a freshly created window whose identifier age is small,
+    /// while the source window's stale indicator keeps a large age. Old
+    /// simultaneous playback stays ambiguous and is left alone.
+    static func bestMediaTarget(
+        _ mediaIdentifiers: Set<String>,
+        ages: [String: Int],
+        freshWindowAgeTicks: Int
+    ) -> String? {
+        if mediaIdentifiers.count == 1 {
+            return mediaIdentifiers.first
+        }
+        guard mediaIdentifiers.count > 1 else { return nil }
+        let minimumAge = mediaIdentifiers.map { ages[$0] ?? 0 }.min() ?? 0
+        let freshest = mediaIdentifiers.filter { (ages[$0] ?? 0) == minimumAge }
+        guard freshest.count == 1,
+              minimumAge <= freshWindowAgeTicks else { return nil }
+        return freshest.first
+    }
 }
 
 enum DisplayTransitionPolicy {

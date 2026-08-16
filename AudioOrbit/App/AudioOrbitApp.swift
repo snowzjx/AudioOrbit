@@ -125,6 +125,14 @@ private final class AudioOrbitStatusItemController: NSObject {
         statusMenu.addItem(routingToggleItem)
         statusMenu.addItem(.separator())
 
+        let settings = NSMenuItem(
+            title: "Settings…",
+            action: #selector(openSettings),
+            keyEquivalent: ","
+        )
+        settings.target = self
+        statusMenu.addItem(settings)
+
         let checkUpdates = NSMenuItem(
             title: "Check for Updates…",
             action: #selector(checkForUpdates),
@@ -163,6 +171,37 @@ private final class AudioOrbitStatusItemController: NSObject {
 
     @objc private func toggleRouting() {
         Task { await model.toggleAutomaticRouting() }
+    }
+
+    @objc private func openSettings() {
+        // Defer past menu tracking so the action lands after the menu
+        // closes. Dispatch the same action as the main menu's Settings…
+        // item (⌘,), which SwiftUI provides and handles correctly.
+        DispatchQueue.main.async { [weak self] in
+            self?.dispatchSettingsMenuItemAction()
+        }
+    }
+
+    private func dispatchSettingsMenuItemAction() {
+        if let item = Self.settingsMenuItem(), let action = item.action {
+            NSApp.sendAction(action, to: item.target, from: item)
+        } else {
+            // Fallback if the SwiftUI main menu has not been built yet.
+            NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+        }
+        // Bring the window forward without changing the activation policy,
+        // so no Dock icon appears for this menu-bar-only app.
+        NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps])
+    }
+
+    private static func settingsMenuItem() -> NSMenuItem? {
+        for top in NSApp.mainMenu?.items ?? [] {
+            guard let submenu = top.submenu else { continue }
+            for item in submenu.items where item.keyEquivalent == "," {
+                return item
+            }
+        }
+        return nil
     }
 
     @objc private func checkForUpdates() {

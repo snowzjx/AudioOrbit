@@ -27,6 +27,23 @@ xcodebuild archive \
 app_path="${archive_path}/Products/Applications/AudioOrbit.app"
 package_path="${output_directory}/AudioOrbit.zip"
 
+sparkle_framework="${app_path}/Contents/Frameworks/Sparkle.framework"
+# Sparkle's nested binaries arrive with non-notarizable signatures;
+# re-sign every nested bundle with the Developer ID identity and a
+# secure timestamp before packaging.
+codesign --force --options runtime --timestamp --sign "Developer ID Application" \
+  "${sparkle_framework}/Versions/B/XPCServices/Installer.xpc"
+codesign --force --options runtime --timestamp --sign "Developer ID Application" \
+  "${sparkle_framework}/Versions/B/XPCServices/Downloader.xpc"
+codesign --force --options runtime --timestamp --sign "Developer ID Application" \
+  "${sparkle_framework}/Versions/B/Updater.app"
+codesign --force --options runtime --timestamp --sign "Developer ID Application" \
+  "${sparkle_framework}/Versions/B/Autoupdate"
+codesign --force --options runtime --timestamp --sign "Developer ID Application" \
+  "${sparkle_framework}"
+codesign --force --options runtime --timestamp --sign "Developer ID Application" \
+  "${app_path}"
+
 codesign --verify --deep --strict --verbose=2 "${app_path}"
 codesign -dvv "${app_path}"
 ditto -c -k --keepParent "${app_path}" "${package_path}"

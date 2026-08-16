@@ -77,9 +77,25 @@ jobs:
             MARKETING_VERSION="$VERSION" \
             clean archive
 
-      - name: Verify signature
+      - name: Sign embedded code and verify
         run: |
           APP_PATH="build/AudioOrbit.xcarchive/Products/Applications/AudioOrbit.app"
+          SPARKLE="$APP_PATH/Contents/Frameworks/Sparkle.framework"
+          # Sparkle's nested binaries arrive with non-notarizable
+          # signatures; re-sign every nested bundle with the Developer ID
+          # identity and a secure timestamp before packaging.
+          codesign --force --options runtime --timestamp --sign "Developer ID Application" \
+            "$SPARKLE/Versions/B/XPCServices/Installer.xpc"
+          codesign --force --options runtime --timestamp --sign "Developer ID Application" \
+            "$SPARKLE/Versions/B/XPCServices/Downloader.xpc"
+          codesign --force --options runtime --timestamp --sign "Developer ID Application" \
+            "$SPARKLE/Versions/B/Updater.app"
+          codesign --force --options runtime --timestamp --sign "Developer ID Application" \
+            "$SPARKLE/Versions/B/Autoupdate"
+          codesign --force --options runtime --timestamp --sign "Developer ID Application" \
+            "$SPARKLE"
+          codesign --force --options runtime --timestamp --sign "Developer ID Application" \
+            "$APP_PATH"
           codesign --verify --deep --strict --verbose=2 "$APP_PATH"
           codesign -dvv "$APP_PATH"
           ditto -c -k --keepParent "$APP_PATH" build/AudioOrbit-notarize.zip

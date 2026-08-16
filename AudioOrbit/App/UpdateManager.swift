@@ -35,13 +35,21 @@ final class UpdateManager: NSObject, ObservableObject {
     }
 
     func checkForUpdates() {
-        guard let controller = updaterController else {
+        guard updaterController != nil else {
             status = .failed("The updater is unavailable in this build.")
             return
         }
+        NSLog("[Update] User requested an update check")
         status = .checking
-        presentUpdaterUI()
-        controller.checkForUpdates(nil)
+        // Menu actions run while the menu is still tracking; an activation
+        // request made from that context is dropped by AppKit, which leaves
+        // Sparkle's status window invisible. Defer to the next runloop tick
+        // so the menu has fully closed before activating and checking.
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.presentUpdaterUI()
+            self.updaterController?.checkForUpdates(nil)
+        }
     }
 
     /// AudioOrbit is a menu-bar-only app (LSUIElement), so its activation
@@ -53,7 +61,7 @@ final class UpdateManager: NSObject, ObservableObject {
         if NSApp.activationPolicy() != .regular {
             NSApp.setActivationPolicy(.regular)
         }
-        NSApp.activate(ignoringOtherApps: true)
+        NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps])
     }
 
     private func restoreAccessoryPolicyIfIdle() {

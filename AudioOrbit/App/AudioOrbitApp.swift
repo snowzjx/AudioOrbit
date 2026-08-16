@@ -47,7 +47,10 @@ final class AudioOrbitAppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         guard statusItemController == nil else { return }
-        statusItemController = AudioOrbitStatusItemController(model: model)
+        statusItemController = AudioOrbitStatusItemController(
+            model: model,
+            updateManager: updateManager
+        )
         if !isRunningTests {
             updateManager.startUpdaterIfNeeded()
         }
@@ -65,10 +68,6 @@ final class AudioOrbitAppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    func checkForUpdates() {
-        updateManager.checkForUpdates()
-    }
-
     func applicationWillTerminate(_ notification: Notification) {
         model.applicationWillTerminate()
     }
@@ -77,14 +76,16 @@ final class AudioOrbitAppDelegate: NSObject, NSApplicationDelegate {
 @MainActor
 private final class AudioOrbitStatusItemController: NSObject {
     private let model: AppModel
+    private let updateManager: UpdateManager
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let popover = NSPopover()
     private let statusMenu = NSMenu()
     private let routingToggleItem = NSMenuItem()
     private var modelObservation: AnyCancellable?
 
-    init(model: AppModel) {
+    init(model: AppModel, updateManager: UpdateManager) {
         self.model = model
+        self.updateManager = updateManager
         super.init()
 
         popover.behavior = .transient
@@ -165,7 +166,10 @@ private final class AudioOrbitStatusItemController: NSObject {
     }
 
     @objc private func checkForUpdates() {
-        (NSApp.delegate as? AudioOrbitAppDelegate)?.checkForUpdates()
+        // Note: NSApp.delegate is SwiftUI's own AppDelegate wrapper, not
+        // AudioOrbitAppDelegate, so route through the injected manager
+        // instead of casting NSApp.delegate (that cast silently returns nil).
+        updateManager.checkForUpdates()
     }
 
     @objc private func quitApplication() {

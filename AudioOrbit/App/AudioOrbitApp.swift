@@ -1,6 +1,7 @@
 import AppKit
 import Combine
 import Foundation
+import Sparkle
 import SwiftUI
 
 @main
@@ -19,6 +20,7 @@ final class AudioOrbitAppDelegate: NSObject, NSApplicationDelegate {
     let model: AppModel
     private var statusItemController: AudioOrbitStatusItemController?
     private var onboardingWindowController: OnboardingWindowController?
+    private var updaterController: SPUStandardUpdaterController?
     private let isRunningTests: Bool
 
     override init() {
@@ -43,11 +45,22 @@ final class AudioOrbitAppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         guard statusItemController == nil else { return }
         statusItemController = AudioOrbitStatusItemController(model: model)
+        if !isRunningTests {
+            updaterController = SPUStandardUpdaterController(
+                startingUpdater: true,
+                updaterDelegate: nil,
+                userDriverDelegate: nil
+            )
+        }
         if !isRunningTests, !model.hasCompletedOnboarding {
             let controller = OnboardingWindowController(model: model)
             onboardingWindowController = controller
             controller.present()
         }
+    }
+
+    func checkForUpdates() {
+        updaterController?.checkForUpdates(nil)
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -115,6 +128,15 @@ private final class AudioOrbitStatusItemController: NSObject {
         menu.addItem(toggle)
         menu.addItem(.separator())
 
+        let checkUpdates = NSMenuItem(
+            title: "Check for Updates…",
+            action: #selector(checkForUpdates),
+            keyEquivalent: ""
+        )
+        checkUpdates.target = self
+        menu.addItem(checkUpdates)
+        menu.addItem(.separator())
+
         let quit = NSMenuItem(
             title: "Quit AudioOrbit",
             action: #selector(quitApplication),
@@ -131,6 +153,10 @@ private final class AudioOrbitStatusItemController: NSObject {
 
     @objc private func toggleRouting() {
         Task { await model.toggleAutomaticRouting() }
+    }
+
+    @objc private func checkForUpdates() {
+        (NSApp.delegate as? AudioOrbitAppDelegate)?.checkForUpdates()
     }
 
     @objc private func quitApplication() {

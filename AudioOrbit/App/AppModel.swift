@@ -2,6 +2,7 @@ import AppKit
 import CoreAudio
 import Foundation
 import UniformTypeIdentifiers
+import UserNotifications
 
 @MainActor
 final class AppModel: ObservableObject {
@@ -16,6 +17,7 @@ final class AppModel: ObservableObject {
     @Published private(set) var accessibilityGranted = false
     @Published private(set) var windowDiscoveryMessage: String?
     @Published private(set) var launchAtLoginEnabled = false
+    @Published private(set) var followNotificationsEnabled = false
     @Published private(set) var automaticRoutingEnabled = false
     @Published private(set) var automaticRoutingMessage: String?
     @Published private(set) var headphoneOverrideEnabled = false
@@ -116,6 +118,7 @@ final class AppModel: ObservableObject {
     private static let mediaAnchorMissToleranceTicks = 3
     private static let freshMediaWindowAgeTicks = 12
     private static let anchoredPIDMissingToleranceTicks = 6
+    private static let followNotificationsDefaultsKey = "AudioOrbitFollowNotificationsEnabled"
 
     private let discovery = AudioDiscovery()
     private let deviceMonitor = AudioDeviceMonitor()
@@ -218,6 +221,9 @@ final class AppModel: ObservableObject {
         self.onboardingStore = onboardingStore
         hasCompletedOnboarding = onboardingStore.isCompleted
         launchAtLoginEnabled = LaunchAtLogin.isEnabled
+        followNotificationsEnabled = UserDefaults.standard.bool(
+            forKey: Self.followNotificationsDefaultsKey
+        )
         let loadedConfiguration = mappingStore.load()
         mappings = loadedConfiguration.configuration.mappings
         automaticRoutingEnabled = loadedConfiguration.configuration.routingEnabled
@@ -264,6 +270,35 @@ final class AppModel: ObservableObject {
         refreshLaunchAtLoginStatus()
         await reconcileAudioHardware(clearErrorOnSuccess: true)
         await refreshWindowEvidence()
+    }
+
+    func setFollowNotificationsEnabled(_ enabled: Bool) async {
+        followNotificationsEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: Self.followNotificationsDefaultsKey)
+        if enabled {
+            do {
+                let granted = try await UNUserNotificationCenter.current()
+                    .requestAuthorization(options: [.alert, .sound])
+                if !granted {
+                    lastError = "Notifications are disabled in System Settings, so follow feedback will not appear."
+                }
+            } catch {
+                lastError = "AudioOrbit could not request notification permission: \(error)"
+            }
+        }
+    }
+
+    private func postFollowNotification(for session: RouteSession) {
+        guard followNotificationsEnabled else { return }
+        let content = UNMutableNotificationContent()
+        content.title = "AudioOrbit"
+        content.body = "\(session.sourceName) is now playing through \(session.destinationName)."
+        let request = UNNotificationRequest(
+            identifier: UUID().uuidString,
+            content: content,
+            trigger: nil
+        )
+        UNUserNotificationCenter.current().add(request)
     }
 
     func setLaunchAtLoginEnabled(_ enabled: Bool) async {
@@ -818,6 +853,11 @@ final class AppModel: ObservableObject {
             session.destinationName = destination.name
             session.state = .running
             diagnostics.record("switch-succeeded", category: "route")
+            if session.isAutomatic,
+               let followedDisplay = session.followedDisplayName,
+               followedDisplay != "Headphone Override" {
+                postFollowNotification(for: session)
+            }
             if persistDestination {
                 cacheAutomaticSession(session)
             }

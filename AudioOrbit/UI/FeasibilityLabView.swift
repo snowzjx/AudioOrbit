@@ -105,6 +105,22 @@ struct AudioOrbitSettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
+
+                Toggle(
+                    "Notify when audio follows a window",
+                    isOn: Binding(
+                        get: { model.followNotificationsEnabled },
+                        set: { enabled in
+                            Task { await model.setFollowNotificationsEnabled(enabled) }
+                        }
+                    )
+                )
+                .accessibilityHint("Shows a notification when a route switches to another output")
+
+                Text("A notification appears whenever an application's audio follows its window to a different output. Notification permission is requested the first time this is enabled.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.top, 4)

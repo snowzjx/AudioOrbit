@@ -28,7 +28,13 @@
 	<true/>
 	<key>LSUIElement</key>
 	<true/>
+	<key>SUFeedURL</key>
+	<string>https://github.com/snowzjx/AudioOrbit/releases/download/appcast/appcast.xml</string>
+	<key>SUEnableInstallerLauncherService</key>
+	<true/>
+	<key>SUPublicEDKey</key>
+	<string>DZjTp3liON5I5v8dvqYfC5UCSRG4ux1JQhvo59siBiE=</string>
 	<key>NSAudioCaptureUsageDescription</key>
-	<string>AudioOrbit needs system audio access to route each application's sound to the output assigned to its display. Audio is never recorded or transmitted.</string>
+	<string>AudioOrbit needs system audio access to route each application&apos;s sound to the output assigned to its display. Audio is never recorded or transmitted.</string>
 </dict>
 </plist>

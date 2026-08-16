@@ -11,6 +11,8 @@ AudioOrbit is a native macOS menu-bar app that sends each application's audio to
 - Headphone Override sends all managed audio to one selected device and restores display routing when it disconnects.
 - Physical-device volume controls when the output exposes a writable Core Audio volume control.
 - Optional launch at login from Settings → General.
+- Optional notification when an application's audio follows its window to a different output.
+- Automatic updates via Sparkle (menu bar → right-click → Check for Updates).
 - Safe pass-through when permission, capture, or destination failures occur.
 - Private by design: audio stays in bounded volatile memory and is never stored, transmitted, transcribed, or analyzed.
 

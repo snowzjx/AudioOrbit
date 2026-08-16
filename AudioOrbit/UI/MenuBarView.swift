@@ -12,6 +12,10 @@ struct MenuBarView: View {
         VStack(alignment: .leading, spacing: 16) {
             header
 
+            if !model.accessibilityGranted {
+                permissionBanner
+            }
+
             if let override = model.activeHeadphoneOverrideDevice {
                 Label("Headphone Override · \(override.name)", systemImage: "headphones")
                     .font(.caption.weight(.medium))
@@ -35,6 +39,34 @@ struct MenuBarView: View {
         }
         .padding(16)
         .frame(width: 410)
+    }
+
+    private var permissionBanner: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Label("Window access is required", systemImage: "hand.raised.fill")
+                .font(.caption.weight(.medium))
+                .foregroundStyle(.orange)
+            Text("AudioOrbit needs Accessibility permission to see which display contains each application window.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 8) {
+                Button("Grant…") {
+                    Task { await model.requestAccessibilityAccess() }
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                Button("Open Settings") {
+                    model.openAccessibilitySettings()
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                Spacer()
+            }
+        }
+        .padding(11)
+        .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 12))
+        .accessibilityElement(children: .contain)
     }
 
     private var header: some View {
@@ -130,17 +162,6 @@ struct MenuBarView: View {
                 .help("Retry restoring normal playback")
                 .accessibilityLabel("Retry cleanup for \(route.sourceName)")
             }
-            if route.isAutomatic, !route.isCached, route.supportsManualReanchor {
-                Button {
-                    Task { await model.reanchorRouteToFocusedWindow(route.id) }
-                } label: {
-                    Image(systemName: "scope")
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(.secondary)
-                .help("Anchor this route to the focused window now")
-                .accessibilityLabel("Anchor \(route.sourceName) to the focused window")
-            }
             Button(role: .destructive) {
                 Task { await model.ignoreRoute(route.id) }
             } label: {
@@ -155,6 +176,32 @@ struct MenuBarView: View {
         }
         .padding(12)
         .glassCard(cornerRadius: 14)
+        // Make the whole card the hit region for the context menu, not
+        // just the text and buttons inside it.
+        .contentShape(Rectangle())
+        .contextMenu {
+            if route.isAutomatic, !route.isCached, route.supportsManualReanchor {
+                Button {
+                    Task { await model.reanchorRouteToFocusedWindow(route.id) }
+                } label: {
+                    Label("Follow Focused Window", systemImage: "scope")
+                }
+                .help("Re-anchor this route to the focused window now")
+            }
+            if route.requiresCleanupRetry {
+                Button {
+                    Task { await model.retryRouteCleanup(route.id) }
+                } label: {
+                    Label("Retry Restoring Playback", systemImage: "arrow.clockwise")
+                }
+            }
+            Divider()
+            Button(role: .destructive) {
+                Task { await model.ignoreRoute(route.id) }
+            } label: {
+                Label("Stop and Ignore", systemImage: "trash")
+            }
+        }
     }
 
     private func applicationIcon(for route: ProbeRouteSnapshot) -> some View {

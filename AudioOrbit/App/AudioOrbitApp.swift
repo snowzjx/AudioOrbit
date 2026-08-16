@@ -73,6 +73,8 @@ private final class AudioOrbitStatusItemController: NSObject {
     private let model: AppModel
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let popover = NSPopover()
+    private let statusMenu = NSMenu()
+    private let routingToggleItem = NSMenuItem()
     private var modelObservation: AnyCancellable?
 
     init(model: AppModel) {
@@ -86,47 +88,35 @@ private final class AudioOrbitStatusItemController: NSObject {
             rootView: MenuBarView(model: model)
         )
 
-        if let button = statusItem.button {
-            button.target = self
-            button.action = #selector(statusItemClicked(_:))
-            button.sendAction(on: [.leftMouseUp, .rightMouseUp])
-            button.toolTip = "AudioOrbit — right-click to enable or disable"
-            button.setAccessibilityLabel("AudioOrbit")
-            button.setAccessibilityHelp(
-                "Left-click for routes and output volume. Right-click to enable, disable, or quit."
-            )
-        }
-        updateIcon()
+        configureStatusButton()
+        configureStatusMenu()
+        refresh()
         modelObservation = model.objectWillChange.sink { [weak self] _ in
-            DispatchQueue.main.async { self?.updateIcon() }
+            DispatchQueue.main.async { self?.refresh() }
         }
     }
 
-    @objc private func statusItemClicked(_ sender: NSStatusBarButton) {
-        if NSApp.currentEvent?.type == .rightMouseUp {
-            showContextMenu(relativeTo: sender)
-        } else if popover.isShown {
-            popover.performClose(sender)
-        } else {
-            popover.show(relativeTo: sender.bounds, of: sender, preferredEdge: .minY)
-            popover.contentViewController?.view.window?.makeKey()
-        }
+    private func configureStatusButton() {
+        guard let button = statusItem.button else { return }
+        // Swap in a button subclass so left clicks open the popover while
+        // right clicks fall through to AppKit, which presents
+        // statusItem.menu natively (system header, positioning, highlight).
+        object_setClass(button, AudioOrbitStatusBarButton.self)
+        button.target = self
+        button.action = #selector(handleLeftClick(_:))
+        button.toolTip = "AudioOrbit — right-click to enable or disable"
+        button.setAccessibilityLabel("AudioOrbit")
+        button.setAccessibilityHelp(
+            "Left-click for routes and output volume. Right-click to enable, disable, or quit."
+        )
     }
 
-    private func showContextMenu(relativeTo button: NSStatusBarButton) {
-        let menu = NSMenu()
-        let toggle = NSMenuItem(
-            title: model.automaticRoutingEnabled ? "Disable AudioOrbit" : "Enable AudioOrbit",
-            action: #selector(toggleRouting),
-            keyEquivalent: ""
-        )
-        toggle.target = self
-        toggle.image = NSImage(
-            systemSymbolName: model.automaticRoutingEnabled ? "pause.fill" : "play.fill",
-            accessibilityDescription: nil
-        )
-        menu.addItem(toggle)
-        menu.addItem(.separator())
+    private func configureStatusMenu() {
+        routingToggleItem.target = self
+        routingToggleItem.action = #selector(toggleRouting)
+        routingToggleItem.keyEquivalent = ""
+        statusMenu.addItem(routingToggleItem)
+        statusMenu.addItem(.separator())
 
         let checkUpdates = NSMenuItem(
             title: "Check for Updates…",
@@ -134,8 +124,8 @@ private final class AudioOrbitStatusItemController: NSObject {
             keyEquivalent: ""
         )
         checkUpdates.target = self
-        menu.addItem(checkUpdates)
-        menu.addItem(.separator())
+        statusMenu.addItem(checkUpdates)
+        statusMenu.addItem(.separator())
 
         let quit = NSMenuItem(
             title: "Quit AudioOrbit",
@@ -143,12 +133,25 @@ private final class AudioOrbitStatusItemController: NSObject {
             keyEquivalent: "q"
         )
         quit.target = self
-        menu.addItem(quit)
-        menu.popUp(
-            positioning: nil,
-            at: NSPoint(x: 0, y: button.bounds.height + 4),
-            in: button
-        )
+        statusMenu.addItem(quit)
+
+        statusItem.menu = statusMenu
+    }
+
+    private func refresh() {
+        routingToggleItem.title = model.automaticRoutingEnabled
+            ? "Disable AudioOrbit"
+            : "Enable AudioOrbit"
+        updateIcon()
+    }
+
+    @objc private func handleLeftClick(_ sender: NSStatusBarButton) {
+        if popover.isShown {
+            popover.performClose(sender)
+        } else {
+            popover.show(relativeTo: sender.bounds, of: sender, preferredEdge: .minY)
+            popover.contentViewController?.view.window?.makeKey()
+        }
     }
 
     @objc private func toggleRouting() {
@@ -172,5 +175,17 @@ private final class AudioOrbitStatusItemController: NSObject {
         button.image?.isTemplate = true
         let state = model.automaticRoutingEnabled ? "enabled" : "disabled"
         button.setAccessibilityValue("AudioOrbit is \(state)")
+    }
+}
+
+/// Left clicks are claimed by the controller (popover); right clicks are
+/// forwarded to AppKit so it presents the status item's menu natively.
+private final class AudioOrbitStatusBarButton: NSStatusBarButton {
+    override func mouseDown(with event: NSEvent) {
+        _ = sendAction(action, to: target)
+    }
+
+    override func rightMouseDown(with event: NSEvent) {
+        super.rightMouseDown(with: event)
     }
 }

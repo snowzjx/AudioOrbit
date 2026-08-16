@@ -4,6 +4,7 @@ import SwiftUI
 
 struct AudioOrbitSettingsView: View {
     @ObservedObject var model: AppModel
+    @ObservedObject var updateManager: UpdateManager
 
     var body: some View {
         TabView {
@@ -22,6 +23,9 @@ struct AudioOrbitSettingsView: View {
 
             settingsPage { diagnostics }
                 .tabItem { Label("Support", systemImage: "stethoscope") }
+
+            settingsPage { about }
+                .tabItem { Label("About", systemImage: "info.circle") }
         }
         .frame(
             minWidth: 700,
@@ -40,6 +44,88 @@ struct AudioOrbitSettingsView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(22)
         }
+    }
+
+    private var about: some View {
+        GroupBox {
+            VStack(alignment: .leading, spacing: 14) {
+                HStack(spacing: 14) {
+                    Image(nsImage: NSApp.applicationIconImage)
+                        .resizable()
+                        .frame(width: 64, height: 64)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("AudioOrbit")
+                            .font(.title2.weight(.semibold))
+                        Text("Version \(marketingVersion) (\(buildNumber))")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                updateStatusView
+
+                HStack(spacing: 10) {
+                    Button("Check for Updates") {
+                        updateManager.checkForUpdates()
+                    }
+                    .disabled(updateManager.status == .checking)
+
+                    if updateManager.status == .checking {
+                        ProgressView()
+                            .controlSize(.small)
+                    }
+                }
+
+                if let lastCheckedAt = updateManager.lastCheckedAt {
+                    Text("Last checked: \(lastCheckedAt.formatted(date: .abbreviated, time: .shortened))")
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.top, 4)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    @ViewBuilder
+    private var updateStatusView: some View {
+        switch updateManager.status {
+        case .idle:
+            Text("Updates are checked automatically in the background.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+        case .checking:
+            Text("Checking for updates…")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+        case .upToDate:
+            Label("You're up to date.", systemImage: "checkmark.circle.fill")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+        case .updateAvailable(let version):
+            Label("Version \(version) is available. Sparkle will guide you through the update.", systemImage: "arrow.down.circle.fill")
+                .font(.callout)
+                .foregroundStyle(.primary)
+        case .failed(let message):
+            VStack(alignment: .leading, spacing: 4) {
+                Label("Update check failed", systemImage: "exclamationmark.triangle.fill")
+                    .font(.callout)
+                    .foregroundStyle(.red)
+                Text(message)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private var marketingVersion: String {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "—"
+    }
+
+    private var buildNumber: String {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "—"
     }
 
     private var displayMappings: some View {

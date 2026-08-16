@@ -10,7 +10,10 @@ struct AudioOrbitApp: App {
 
     var body: some Scene {
         Settings {
-            AudioOrbitSettingsView(model: appDelegate.model)
+            AudioOrbitSettingsView(
+                model: appDelegate.model,
+                updateManager: appDelegate.updateManager
+            )
         }
     }
 }
@@ -20,7 +23,7 @@ final class AudioOrbitAppDelegate: NSObject, NSApplicationDelegate {
     let model: AppModel
     private var statusItemController: AudioOrbitStatusItemController?
     private var onboardingWindowController: OnboardingWindowController?
-    private var updaterController: SPUStandardUpdaterController?
+    let updateManager = UpdateManager()
     private let isRunningTests: Bool
 
     override init() {
@@ -46,11 +49,14 @@ final class AudioOrbitAppDelegate: NSObject, NSApplicationDelegate {
         guard statusItemController == nil else { return }
         statusItemController = AudioOrbitStatusItemController(model: model)
         if !isRunningTests {
-            updaterController = SPUStandardUpdaterController(
-                startingUpdater: true,
-                updaterDelegate: nil,
-                userDriverDelegate: nil
-            )
+            updateManager.startUpdaterIfNeeded()
+        }
+        if !isRunningTests, CommandLine.arguments.contains("--check-updates") {
+            // Diagnostic hook: trigger an update check shortly after launch
+            // so failures can be observed in the unified log.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                self?.updateManager.checkForUpdates()
+            }
         }
         if !isRunningTests, !model.hasCompletedOnboarding {
             let controller = OnboardingWindowController(model: model)
@@ -60,7 +66,7 @@ final class AudioOrbitAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func checkForUpdates() {
-        updaterController?.checkForUpdates(nil)
+        updateManager.checkForUpdates()
     }
 
     func applicationWillTerminate(_ notification: Notification) {

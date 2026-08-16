@@ -164,7 +164,7 @@ jobs:
           run_appcast() {
             "$RUNNER_TEMP/sparkle/bin/generate_appcast" \
               --ed-key-file "$KEY_FILE" \
-              --download-url-prefix "https://github.com/snowzjx/AudioOrbit/releases/download/$GITHUB_REF_NAME" \
+              --download-url-prefix "https://github.com/snowzjx/AudioOrbit/releases/download/$GITHUB_REF_NAME/" \
               -o "$RUNNER_TEMP/appcast.xml" \
               "$APPCAST_INPUT"
           }

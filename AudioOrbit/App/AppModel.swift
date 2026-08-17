@@ -110,6 +110,7 @@ final class AppModel: ObservableObject {
     private static let overviewShrinkRatio: CGFloat = 0.6
     private static let overviewGrowRatio: CGFloat = 1.4
     private static let overviewMinimumWindows = 2
+    private static let overviewHoldMaximumTicks = 240
     private static let reconnectDwell = Duration.seconds(1)
     private static let healthWarmUp = Duration.seconds(3)
     private static let displayChangeDwell = Duration.milliseconds(500)
@@ -149,6 +150,9 @@ final class AppModel: ObservableObject {
     private var windowIdentifierAges: [pid_t: [String: Int]] = [:]
     private var windowFrameAreaHistory: [String: CGFloat] = [:]
     private var overviewHoldActive = false
+    private var overviewHoldRemainingTicks = 0
+    private var tickFrameAreas: [String: CGFloat] = [:]
+    private var previousTickFrameAreas: [String: CGFloat] = [:]
     private var reportedUnassociatedSourcePIDs: Set<pid_t> = []
     private var reportedSessionEvidenceIssuePIDs: Set<pid_t> = []
     private var applicationActivationObserver: NSObjectProtocol?
@@ -537,6 +541,7 @@ final class AppModel: ObservableObject {
             await stopRoute(matchingRouteID, preserveAutomaticMode: true)
         }
         persistConfiguration()
+        evaluateOverviewHold()
         updateAutomaticRoutingSummary()
         publishRoutes()
     }
@@ -1207,6 +1212,7 @@ final class AppModel: ObservableObject {
         requestedDelay: Duration? = nil
     ) async {
         guard automaticRoutingEnabled else { return }
+        tickFrameAreas.removeAll(keepingCapacity: true)
         let currentlyPlayingPIDs = Set(processes.filter(\.isRunningOutput).map(\.pid))
         suppressedAutomaticSourcePIDs.formIntersection(currentlyPlayingPIDs)
         reportedUnassociatedSourcePIDs.formIntersection(currentlyPlayingPIDs)
@@ -1444,10 +1450,7 @@ final class AppModel: ObservableObject {
         state.association = association
         state.evidence = evidence
         if let evidence {
-            updateOverviewHold(
-                evidence: evidence,
-                anchorID: state.committedWindowIdentifier
-            )
+            accumulateOverviewFrames(evidence: evidence)
         }
         if let association,
            let evidence {
@@ -1873,53 +1876,94 @@ final class AppModel: ObservableObject {
     /// desktop window behind a fullscreen video) and land on the wrong
     /// output when Mission Control closes. The hold releases when the
     /// windows grow back to normal sizes.
-    private func updateOverviewHold(
-        evidence: WindowDisplayEvidence,
-        anchorID: String?
-    ) {
-        var shrunkCount = 0
-        var grewCount = 0
+    /// Merges this tick's candidate window frames (across every source)
+    /// so the end-of-tick evaluation can compare the whole desktop's
+    /// geometry against the last stable baseline.
+    private func accumulateOverviewFrames(evidence: WindowDisplayEvidence) {
         for (identifier, frame) in evidence.candidateWindowFrames {
             let area = frame.width * frame.height
             guard area > 0 else { continue }
-            if let previous = windowFrameAreaHistory[identifier], previous > 0 {
-                if area < previous * Self.overviewShrinkRatio {
-                    shrunkCount += 1
-                } else if area > previous * Self.overviewGrowRatio {
+            tickFrameAreas[identifier] = area
+        }
+    }
+
+    /// Mission Control scales every visible window simultaneously; a real
+    /// user resize affects a single window. A mass shrink (or a shrink
+    /// combined with a missing anchor) engages a hold that keeps every
+    /// established route on its committed display, because the overview's
+    /// scaled geometry must never migrate a route — the anchor would
+    /// otherwise fall back to another fresh window (for example Safari's
+    /// desktop window behind a fullscreen video) and land on the wrong
+    /// output when Mission Control closes.
+    ///
+    /// The hold releases as soon as the anchor returns at normal scale,
+    /// or any window grows back, or a backstop timeout expires — it must
+    /// never outlive the overview or freeze tab following.
+    private func evaluateOverviewHold() {
+        if overviewHoldActive {
+            overviewHoldRemainingTicks -= 1
+            var released = false
+            for state in automaticTracking.values {
+                if let anchorID = state.committedWindowIdentifier,
+                   let area = tickFrameAreas[anchorID],
+                   let baseline = windowFrameAreaHistory[anchorID],
+                   baseline > 0,
+                   area >= baseline * 0.9 {
+                    released = true
+                    break
+                }
+            }
+            var grewCount = 0
+            for (identifier, area) in tickFrameAreas {
+                if let previous = previousTickFrameAreas[identifier],
+                   previous > 0,
+                   area > previous * Self.overviewGrowRatio {
                     grewCount += 1
                 }
             }
-            windowFrameAreaHistory[identifier] = area
-        }
-        let anchorMissing = anchorID.map {
-            !evidence.candidateWindowIdentifiers.contains($0)
-        } ?? false
-        if shrunkCount >= Self.overviewMinimumWindows
-            || (shrunkCount >= 1 && anchorMissing) {
-            if !overviewHoldActive {
-                overviewHoldActive = true
-                diagnostics.record(
-                    "overview-hold-engaged",
-                    category: "routing"
-                )
+            if grewCount >= 1 || overviewHoldRemainingTicks <= 0 {
+                released = true
             }
-        } else if shrunkCount == 0, grewCount >= 1 {
-            if overviewHoldActive {
+            if released {
                 overviewHoldActive = false
                 diagnostics.record(
                     "overview-hold-released",
                     category: "routing"
                 )
             }
+        } else {
+            var shrunkCount = 0
+            for (identifier, area) in tickFrameAreas {
+                if let baseline = windowFrameAreaHistory[identifier],
+                   baseline > 0,
+                   area < baseline * Self.overviewShrinkRatio {
+                    shrunkCount += 1
+                }
+            }
+            var anchorMissing = false
+            for state in automaticTracking.values {
+                if let anchorID = state.committedWindowIdentifier,
+                   tickFrameAreas[anchorID] == nil {
+                    anchorMissing = true
+                    break
+                }
+            }
+            if shrunkCount >= Self.overviewMinimumWindows
+                || (shrunkCount >= 1 && anchorMissing) {
+                overviewHoldActive = true
+                overviewHoldRemainingTicks = Self.overviewHoldMaximumTicks
+                diagnostics.record(
+                    "overview-hold-engaged",
+                    category: "routing"
+                )
+            }
+            // The baseline only advances while the overview is not
+            // active, so scaled frames never poison it.
+            windowFrameAreaHistory = tickFrameAreas
         }
+        previousTickFrameAreas = tickFrameAreas
     }
 
-    /// True when the anchored window is currently invisible and no
-    /// replacement window has appeared — the signature of a fullscreen
-    /// transition, which removes the standard AX window while the audio
-    /// keeps playing. While this holds, the route must keep its last
-    /// committed display instead of following the fallback selection or
-    /// the focus-driven media indicator.
     private func anchorIsTemporarilyInvisible(
         state: AutomaticTrackingState,
         evidence: WindowDisplayEvidence?

@@ -888,7 +888,7 @@ Do not silently answer these questions in production code. Record evidence and d
 - [SwiftUI `Settings`](https://developer.apple.com/documentation/swiftui/settings)
 - [SwiftUI `SettingsLink`](https://developer.apple.com/documentation/swiftui/settingslink)
 
-## 26. UI/UX backlog
+## 27. UI/UX backlog
 
 Prioritized by daily impact × effort:
 

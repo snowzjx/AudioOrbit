@@ -107,6 +107,9 @@ final class AppModel: ObservableObject {
     }
 
     private static let hardwareChangeCoalescingDelay = Duration.milliseconds(100)
+    private static let overviewShrinkRatio: CGFloat = 0.6
+    private static let overviewGrowRatio: CGFloat = 1.4
+    private static let overviewMinimumWindows = 2
     private static let reconnectDwell = Duration.seconds(1)
     private static let healthWarmUp = Duration.seconds(3)
     private static let displayChangeDwell = Duration.milliseconds(500)
@@ -144,6 +147,8 @@ final class AppModel: ObservableObject {
 
 
     private var windowIdentifierAges: [pid_t: [String: Int]] = [:]
+    private var windowFrameAreaHistory: [String: CGFloat] = [:]
+    private var overviewHoldActive = false
     private var reportedUnassociatedSourcePIDs: Set<pid_t> = []
     private var reportedSessionEvidenceIssuePIDs: Set<pid_t> = []
     private var applicationActivationObserver: NSObjectProtocol?
@@ -1438,6 +1443,12 @@ final class AppModel: ObservableObject {
         state.wasRunningOutput = source.isRunningOutput
         state.association = association
         state.evidence = evidence
+        if let evidence {
+            updateOverviewHold(
+                evidence: evidence,
+                anchorID: state.committedWindowIdentifier
+            )
+        }
         if let association,
            let evidence {
             // The playback window is identified by the strongest available
@@ -1561,7 +1572,7 @@ final class AppModel: ObservableObject {
                     let anchorInvisible = anchorIsTemporarilyInvisible(
                         state: state,
                         evidence: evidence
-                    )
+                    ) || overviewHoldActive
                     if state.anchoredPIDMissingTickCount
                         >= Self.anchoredPIDMissingToleranceTicks,
                        !anchorInvisible {
@@ -1642,10 +1653,10 @@ final class AppModel: ObservableObject {
             if state.committedWindowIdentifier != nil,
                evidence?.selectedWindowIdentifier != nil,
                evidence?.selectionSource != .routeAnchor,
-               !anchorIsTemporarilyInvisible(
+               !(anchorIsTemporarilyInvisible(
                    state: state,
                    evidence: evidence
-               ) {
+               ) || overviewHoldActive) {
                 state.anchorMissTickCount += 1
                 if state.anchorMissTickCount >= Self.anchorStalenessTicks {
                     state.anchorMissTickCount = 0
@@ -1685,7 +1696,7 @@ final class AppModel: ObservableObject {
         let anchorTemporarilyInvisible = anchorIsTemporarilyInvisible(
             state: state,
             evidence: evidence
-        )
+        ) || overviewHoldActive
         if candidateDisplayUUID == nil || anchorTemporarilyInvisible,
            let committedDisplayUUID = state.committedDisplayUUID,
            displays.contains(where: { $0.id == committedDisplayUUID }),
@@ -1851,6 +1862,56 @@ final class AppModel: ObservableObject {
             displayName: display.name,
             destination: destination
         )
+    }
+
+    /// Mission Control scales every visible window simultaneously; a real
+    /// user resize affects a single window. A mass shrink (or a shrink
+    /// combined with a missing anchor) engages a hold that keeps every
+    /// established route on its committed display, because the overview's
+    /// scaled geometry must never migrate a route — the anchor would
+    /// otherwise fall back to another fresh window (for example Safari's
+    /// desktop window behind a fullscreen video) and land on the wrong
+    /// output when Mission Control closes. The hold releases when the
+    /// windows grow back to normal sizes.
+    private func updateOverviewHold(
+        evidence: WindowDisplayEvidence,
+        anchorID: String?
+    ) {
+        var shrunkCount = 0
+        var grewCount = 0
+        for (identifier, frame) in evidence.candidateWindowFrames {
+            let area = frame.width * frame.height
+            guard area > 0 else { continue }
+            if let previous = windowFrameAreaHistory[identifier], previous > 0 {
+                if area < previous * Self.overviewShrinkRatio {
+                    shrunkCount += 1
+                } else if area > previous * Self.overviewGrowRatio {
+                    grewCount += 1
+                }
+            }
+            windowFrameAreaHistory[identifier] = area
+        }
+        let anchorMissing = anchorID.map {
+            !evidence.candidateWindowIdentifiers.contains($0)
+        } ?? false
+        if shrunkCount >= Self.overviewMinimumWindows
+            || (shrunkCount >= 1 && anchorMissing) {
+            if !overviewHoldActive {
+                overviewHoldActive = true
+                diagnostics.record(
+                    "overview-hold-engaged",
+                    category: "routing"
+                )
+            }
+        } else if shrunkCount == 0, grewCount >= 1 {
+            if overviewHoldActive {
+                overviewHoldActive = false
+                diagnostics.record(
+                    "overview-hold-released",
+                    category: "routing"
+                )
+            }
+        }
     }
 
     /// True when the anchored window is currently invisible and no

@@ -132,6 +132,11 @@ struct AccessibilityWindowDiscovery {
                 displayName: nil,
                 issue: "No visible application window intersects a connected display.",
                 candidateWindowIdentifiers: candidates.map(\.stableIdentifier),
+                candidateWindowFrames: Dictionary(
+                    uniqueKeysWithValues: candidates.map {
+                        ($0.stableIdentifier, $0.frame)
+                    }
+                ),
                 focusedWindowIdentifier: candidates.first(where: \.isFocused)?
                     .stableIdentifier,
                 mediaPlayingWindowIdentifiers: candidates.filter(\.hasMediaIndicator)
@@ -159,6 +164,11 @@ struct AccessibilityWindowDiscovery {
             displayName: display?.name,
             issue: display == nil ? "The selected window does not intersect a connected display." : nil,
             candidateWindowIdentifiers: candidates.map(\.stableIdentifier),
+            candidateWindowFrames: Dictionary(
+                uniqueKeysWithValues: candidates.map {
+                    ($0.stableIdentifier, $0.frame)
+                }
+            ),
             focusedWindowIdentifier: candidates.first(where: \.isFocused)?
                 .stableIdentifier,
             mediaPlayingWindowIdentifiers: candidates.filter(\.hasMediaIndicator)

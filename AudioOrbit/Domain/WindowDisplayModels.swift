@@ -45,6 +45,9 @@ struct WindowDisplayEvidence: Equatable, Sendable {
     let displayName: String?
     let issue: String?
     let candidateWindowIdentifiers: [String]
+    /// Frames of all candidate windows/surfaces by stable identifier, used
+    /// to detect Mission Control's simultaneous window scaling.
+    var candidateWindowFrames: [String: CGRect] = [:]
     let focusedWindowIdentifier: String?
     var mediaPlayingWindowIdentifiers: [String] = []
     var webViewProcessIDsByWindow: [String: pid_t] = [:]

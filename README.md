@@ -48,5 +48,4 @@ The automated suite contains 60 tests.
 ## Documentation
 
 - [Product specification](PROJECT_SPEC.md)
-- [Audio routing architecture](docs/ADR-001-audio-routing-engine.md)
-- [Performance budgets](docs/PERFORMANCE_BUDGETS.md)
+- [Architecture](docs/ARCHITECTURE.md)

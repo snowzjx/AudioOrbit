@@ -707,7 +707,7 @@ Core feasibility is complete and ADR-001 accepts the current architecture for th
 - [ ] Prove safe recovery after destination unplug, permission denial/revocation where testable, normal quit, force quit, and crash.
 - [ ] Validate Accessibility window discovery for representative AppKit, browser, and Electron apps.
 - [ ] Validate signing, hardened runtime, sandbox choice, permission prompts, relaunch behavior, and intended distribution path.
-- [x] Record the chosen IO architecture, internal format, converter, drift strategy, buffer sizing and known unsupported cases in `docs/ADR-001-audio-routing-engine.md`; distribution remains provisional.
+- [x] Record the chosen IO architecture, internal format, converter, drift strategy, buffer sizing and known unsupported cases in `docs/ARCHITECTURE.md`; distribution remains provisional.
 
 **Gate:** one process can be moved between two physical outputs without changing the system default; two processes can play through different outputs concurrently; failures do not leave a source silently muted. If this cannot be achieved using public APIs with acceptable reliability, stop and document the blocker before considering a virtual driver or revising product scope.
 
@@ -815,8 +815,7 @@ AudioOrbit/
 AudioOrbitTests/
 Config/
 docs/
-├── ADR-001-audio-routing-engine.md
-└── PERFORMANCE_BUDGETS.md
+└── ARCHITECTURE.md
 PROJECT_SPEC.md
 README.md
 ```

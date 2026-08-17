@@ -82,6 +82,8 @@ private final class AudioOrbitStatusItemController: NSObject {
     private let statusMenu = NSMenu()
     private let routingToggleItem = NSMenuItem()
     private var modelObservation: AnyCancellable?
+    private var lastIconSymbol: String?
+    private var lastIconAccessibilityState: String?
 
     init(model: AppModel, updateManager: UpdateManager) {
         self.model = model
@@ -217,13 +219,23 @@ private final class AudioOrbitStatusItemController: NSObject {
 
     private func updateIcon() {
         guard let button = statusItem.button else { return }
-        button.image = NSImage(
-            systemSymbolName: model.menuBarSymbol,
-            accessibilityDescription: "AudioOrbit"
-        )
-        button.image?.isTemplate = true
+        // Only touch the button when something actually changed; the model
+        // publishes several times per second and re-setting the image every
+        // time forces an NSImage symbol lookup plus a full redraw.
+        let symbol = model.menuBarSymbol
+        if symbol != lastIconSymbol {
+            button.image = NSImage(
+                systemSymbolName: symbol,
+                accessibilityDescription: "AudioOrbit"
+            )
+            button.image?.isTemplate = true
+            lastIconSymbol = symbol
+        }
         let state = model.automaticRoutingEnabled ? "enabled" : "disabled"
-        button.setAccessibilityValue("AudioOrbit is \(state)")
+        if state != lastIconAccessibilityState {
+            button.setAccessibilityValue("AudioOrbit is \(state)")
+            lastIconAccessibilityState = state
+        }
     }
 }
 

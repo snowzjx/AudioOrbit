@@ -134,6 +134,7 @@ final class AppModel: ObservableObject {
     private var routeOrder: [UUID] = []
     private var hardwareRefreshTask: Task<Void, Never>?
     private var windowObservationTask: Task<Void, Never>?
+    private var lastDisplayRefreshDate = Date.distantPast
     private var automaticTracking: [pid_t: AutomaticTrackingState] = [:]
     private var automaticRouteIDs: [pid_t: UUID] = [:]
     private var cachedApplicationRoutes: [CachedApplicationRoute] = []
@@ -610,12 +611,18 @@ final class AppModel: ObservableObject {
     }
 
     func refreshWindowEvidence() async {
-        do {
-            displays = try displayDiscovery.snapshots()
-            synchronizeMappingsWithConnectedHardware()
-        } catch {
-            windowDiscoveryMessage = String(describing: error)
-            return
+        // Display topology rarely changes; snapshotting it on every tick is
+        // wasted work. Throttle to once per second and rely on the
+        // DisplayMonitor reconfiguration callback for instant updates.
+        if Date().timeIntervalSince(lastDisplayRefreshDate) >= 1.0 {
+            do {
+                displays = try displayDiscovery.snapshots()
+                synchronizeMappingsWithConnectedHardware()
+                lastDisplayRefreshDate = Date()
+            } catch {
+                windowDiscoveryMessage = String(describing: error)
+                return
+            }
         }
 
         accessibilityGranted = AccessibilityPermission.isGranted
@@ -2112,17 +2119,31 @@ final class AppModel: ObservableObject {
             var automaticPollTick = 0
             while !Task.isCancelled {
                 guard let self else { return }
+                let hasActiveRoutes = !self.automaticRouteIDs.isEmpty
+                let hasPlayingSources = self.processes.contains(where: \.isRunningOutput)
                 if self.automaticRoutingEnabled {
                     automaticPollTick += 1
-                    if automaticPollTick >= 4 {
+                    // Hardware reconciliation can run less often while no
+                    // routes are being managed.
+                    let hardwareTicks = hasActiveRoutes ? 4 : 8
+                    if automaticPollTick >= hardwareTicks {
                         automaticPollTick = 0
                         await self.reconcileAudioHardware(clearErrorOnSuccess: false)
                     }
                 }
                 await self.refreshWindowEvidence()
-                let interval: Duration = self.automaticRoutingEnabled
-                    ? .milliseconds(250)
-                    : .seconds(1)
+                let interval: Duration
+                if self.automaticRoutingEnabled {
+                    // Keep the fast tick while audio is actively routed or
+                    // playing; otherwise relax it to cut wakeups roughly
+                    // threefold. New playback is still picked up within a
+                    // second.
+                    interval = (hasActiveRoutes || hasPlayingSources)
+                        ? .milliseconds(250)
+                        : .milliseconds(750)
+                } else {
+                    interval = .seconds(1)
+                }
                 try? await Task.sleep(for: interval)
             }
         }

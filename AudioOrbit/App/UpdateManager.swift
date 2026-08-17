@@ -61,7 +61,7 @@ final class UpdateManager: NSObject, ObservableObject {
         if NSApp.activationPolicy() != .regular {
             NSApp.setActivationPolicy(.regular)
         }
-        NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps])
+        NSApp.activate()
     }
 
     private func restoreAccessoryPolicyIfIdle() {

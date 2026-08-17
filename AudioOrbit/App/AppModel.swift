@@ -122,6 +122,8 @@ final class AppModel: ObservableObject {
 
     private let discovery = AudioDiscovery()
     private let deviceMonitor = AudioDeviceMonitor()
+    private let processActivityMonitor = AudioProcessActivityMonitor()
+    private let windowEventMonitor = AccessibilityWindowEventMonitor()
     private let displayDiscovery = DisplayDiscovery()
     private let displayMonitor = DisplayMonitor()
     private let processWindowResolver = ProcessWindowAssociationResolver()
@@ -246,12 +248,20 @@ final class AppModel: ObservableObject {
         deviceMonitor.onChange = { [weak self] in
             self?.scheduleHardwareReconciliation()
         }
+        processActivityMonitor.onActivityChange = { [weak self] in
+            self?.scheduleHardwareReconciliation()
+        }
+        windowEventMonitor.onEvent = { [weak self] in
+            Task { await self?.refreshAutomaticWindowEvidence() }
+        }
         displayMonitor.onChange = { [weak self] in
             Task { await self?.refreshWindowEvidence() }
         }
         do {
             try deviceMonitor.start()
             try displayMonitor.start()
+            try processActivityMonitor.start()
+            try windowEventMonitor.start()
         } catch {
             lastError = "AudioOrbit could not watch for hardware changes: \(error)"
         }
@@ -1196,18 +1206,23 @@ final class AppModel: ObservableObject {
         suppressedAutomaticSourcePIDs.formIntersection(currentlyPlayingPIDs)
         reportedUnassociatedSourcePIDs.formIntersection(currentlyPlayingPIDs)
         reportedSessionEvidenceIssuePIDs.formIntersection(currentlyPlayingPIDs)
+        var windowOwnerPIDs: Set<pid_t> = []
         let sources = processes.filter { source in
             let isRelevant = (source.isRunningOutput
                 && !suppressedAutomaticSourcePIDs.contains(source.pid))
                 || automaticRouteIDs[source.pid] != nil
             guard isRelevant else { return false }
             let association = processWindowResolver.resolve(source)
+            if let ownerPID = association?.windowOwner.pid {
+                windowOwnerPIDs.insert(ownerPID)
+            }
             return AutomaticRouteEligibilityPolicy.shouldManage(
                 source: source,
                 association: association,
                 ignoredBundleIdentifiers: ignoredBundleIdentifiers
             )
         }
+        windowEventMonitor.setTrackedApplicationPIDs(windowOwnerPIDs)
         let currentPIDs = Set(processes.map(\.pid))
         let trackedPIDs = Set(automaticTracking.keys).union(automaticRouteIDs.keys)
         let vanishedPIDs = trackedPIDs.filter { !currentPIDs.contains($0) }
@@ -2135,12 +2150,12 @@ final class AppModel: ObservableObject {
                 let interval: Duration
                 if self.automaticRoutingEnabled {
                     // Keep the fast tick while audio is actively routed or
-                    // playing; otherwise relax it to cut wakeups roughly
-                    // threefold. New playback is still picked up within a
-                    // second.
+                    // playing; otherwise relax to a slow safety-net poll.
+                    // Playback starts and window arrivals are already
+                    // event-driven through the CoreAudio and AX observers.
                     interval = (hasActiveRoutes || hasPlayingSources)
                         ? .milliseconds(250)
-                        : .milliseconds(750)
+                        : .seconds(2)
                 } else {
                     interval = .seconds(1)
                 }

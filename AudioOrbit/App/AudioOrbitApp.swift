@@ -193,7 +193,7 @@ private final class AudioOrbitStatusItemController: NSObject {
         }
         // Bring the window forward without changing the activation policy,
         // so no Dock icon appears for this menu-bar-only app.
-        NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps])
+        NSApp.activate()
     }
 
     private static func settingsMenuItem() -> NSMenuItem? {

@@ -6,7 +6,7 @@ project_root="${script_dir:h}"
 archive_path="${AUDIOORBIT_ARCHIVE_PATH:-${project_root}/build/AudioOrbit.xcarchive}"
 output_directory="${AUDIOORBIT_OUTPUT_DIRECTORY:-${project_root}/build}"
 team_id="${AUDIOORBIT_TEAM_ID:-A47Y4XPLXR}"
-version="${AUDIOORBIT_VERSION:-0.3.12}"
+version="${AUDIOORBIT_VERSION:-0.3.13}"
 
 mkdir -p "${output_directory}"
 

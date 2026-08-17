@@ -95,6 +95,7 @@ final class AppModel: ObservableObject {
         var decisionTask: Task<Void, Never>?
         var silentTickCount = 0
         var anchorMissTickCount = 0
+        var anchorEventGateTickCount = 0
         var mediaAnchorDwellTickCount = 0
         var mediaAnchorMissTickCount = 0
         var pendingMediaAnchorID: String?
@@ -111,6 +112,8 @@ final class AppModel: ObservableObject {
     private static let overviewGrowRatio: CGFloat = 1.4
     private static let overviewMinimumWindows = 2
     private static let overviewHoldMaximumTicks = 240
+    private static let axEventGateWindowTicks = 8
+    private static let axEventGateMaximumTicks = 240
     private static let reconnectDwell = Duration.seconds(1)
     private static let healthWarmUp = Duration.seconds(3)
     private static let displayChangeDwell = Duration.milliseconds(500)
@@ -152,6 +155,8 @@ final class AppModel: ObservableObject {
     private var overviewHoldActive = false
     private var overviewHoldRemainingTicks = 0
     private var tickFrameAreas: [String: CGFloat] = [:]
+    private var evidenceTickCounter = 0
+    private var lastAXEventTickByPID: [pid_t: Int] = [:]
     private var previousTickFrameAreas: [String: CGFloat] = [:]
     private var reportedUnassociatedSourcePIDs: Set<pid_t> = []
     private var reportedSessionEvidenceIssuePIDs: Set<pid_t> = []
@@ -260,8 +265,11 @@ final class AppModel: ObservableObject {
         processActivityMonitor.onActivityChange = { [weak self] in
             self?.scheduleHardwareReconciliation()
         }
-        windowEventMonitor.onEvent = { [weak self] in
-            Task { await self?.refreshAutomaticWindowEvidence() }
+        windowEventMonitor.onEvent = { [weak self] ownerPID in
+            Task { @MainActor [weak self] in
+                self?.noteAXEvent(ownerPID: ownerPID)
+                await self?.refreshAutomaticWindowEvidence()
+            }
         }
         displayMonitor.onChange = { [weak self] in
             Task { await self?.refreshWindowEvidence() }
@@ -1213,6 +1221,7 @@ final class AppModel: ObservableObject {
     ) async {
         guard automaticRoutingEnabled else { return }
         tickFrameAreas.removeAll(keepingCapacity: true)
+        evidenceTickCounter += 1
         let currentlyPlayingPIDs = Set(processes.filter(\.isRunningOutput).map(\.pid))
         suppressedAutomaticSourcePIDs.formIntersection(currentlyPlayingPIDs)
         reportedUnassociatedSourcePIDs.formIntersection(currentlyPlayingPIDs)
@@ -1452,6 +1461,7 @@ final class AppModel: ObservableObject {
         if let evidence {
             accumulateOverviewFrames(evidence: evidence)
         }
+        var eventGated = false
         if let association,
            let evidence {
             // The playback window is identified by the strongest available
@@ -1464,6 +1474,11 @@ final class AppModel: ObservableObject {
             // windows report media, the newest one is the destination.
             let ownerPID = association.windowOwner.pid
             let mediaIdentifiers = Set(evidence.mediaPlayingWindowIdentifiers)
+            eventGated = eventGateHolding(
+                state: state,
+                evidence: evidence,
+                ownerPID: ownerPID
+            )
             let pidMap = evidence.webViewProcessIDsByWindow
             if state.pendingSessionRelease {
                 state.pendingSessionRelease = false
@@ -1575,7 +1590,7 @@ final class AppModel: ObservableObject {
                     let anchorInvisible = anchorIsTemporarilyInvisible(
                         state: state,
                         evidence: evidence
-                    ) || overviewHoldActive
+                    ) || overviewHoldActive || eventGated
                     if state.anchoredPIDMissingTickCount
                         >= Self.anchoredPIDMissingToleranceTicks,
                        !anchorInvisible {
@@ -1659,7 +1674,7 @@ final class AppModel: ObservableObject {
                !(anchorIsTemporarilyInvisible(
                    state: state,
                    evidence: evidence
-               ) || overviewHoldActive) {
+               ) || overviewHoldActive || eventGated) {
                 state.anchorMissTickCount += 1
                 if state.anchorMissTickCount >= Self.anchorStalenessTicks {
                     state.anchorMissTickCount = 0
@@ -1699,7 +1714,7 @@ final class AppModel: ObservableObject {
         let anchorTemporarilyInvisible = anchorIsTemporarilyInvisible(
             state: state,
             evidence: evidence
-        ) || overviewHoldActive
+        ) || overviewHoldActive || eventGated
         if candidateDisplayUUID == nil || anchorTemporarilyInvisible,
            let committedDisplayUUID = state.committedDisplayUUID,
            displays.contains(where: { $0.id == committedDisplayUUID }),
@@ -1899,6 +1914,38 @@ final class AppModel: ObservableObject {
     /// The hold releases as soon as the anchor returns at normal scale,
     /// or any window grows back, or a backstop timeout expires — it must
     /// never outlive the overview or freeze tab following.
+    /// Records that a window-level AX event arrived for an application.
+    /// Mission Control never emits these, while genuine window moves and
+    /// tab tear-offs do — so event recency is the discriminator between
+    /// overview transforms and real user actions.
+    private func noteAXEvent(ownerPID: pid_t) {
+        lastAXEventTickByPID[ownerPID] = evidenceTickCounter
+    }
+
+    /// True while the anchor window is missing and no recent AX event
+    /// backs the change — the signature of Mission Control's overview,
+    /// whose scaled geometry must never move a route. Real moves fire
+    /// events and clear the gate immediately.
+    private func eventGateHolding(
+        state: AutomaticTrackingState,
+        evidence: WindowDisplayEvidence,
+        ownerPID: pid_t
+    ) -> Bool {
+        guard let anchorID = state.committedWindowIdentifier,
+              !evidence.candidateWindowIdentifiers.contains(anchorID) else {
+            state.anchorEventGateTickCount = 0
+            return false
+        }
+        let ticksSinceEvent = evidenceTickCounter
+            - (lastAXEventTickByPID[ownerPID] ?? 0)
+        let holding = ticksSinceEvent > Self.axEventGateWindowTicks
+            && state.anchorEventGateTickCount < Self.axEventGateMaximumTicks
+        if holding {
+            state.anchorEventGateTickCount += 1
+        }
+        return holding
+    }
+
     private func evaluateOverviewHold() {
         if overviewHoldActive {
             overviewHoldRemainingTicks -= 1

@@ -12,8 +12,9 @@ import Foundation
 /// model is debounced so a burst of notifications (move + resize + focus)
 /// collapses into a single evidence refresh.
 final class AccessibilityWindowEventMonitor {
-    /// Debounced delivery of the most recent window event batch.
-    var onEvent: (() -> Void)?
+    /// Debounced delivery of the most recent window event batch, carrying
+    /// the PID of the application that owns the affected window.
+    var onEvent: ((pid_t) -> Void)?
 
     private var observer: AXObserver?
     private var trackedApplicationPIDs: Set<pid_t> = []
@@ -38,9 +39,10 @@ final class AccessibilityWindowEventMonitor {
             let monitor = Unmanaged<AccessibilityWindowEventMonitor>
                 .fromOpaque(refcon)
                 .takeUnretainedValue()
-            _ = element
             _ = notification
-            monitor.deliverEvent()
+            var ownerPID: pid_t = 0
+            AXUIElementGetPid(element, &ownerPID)
+            monitor.deliverEvent(ownerPID: ownerPID)
         }
         let result = AXObserverCreate(getpid(), callback, &createdObserver)
         guard result == .success, let createdObserver else {
@@ -123,7 +125,7 @@ final class AccessibilityWindowEventMonitor {
 
     /// Called on the AX run-loop thread; hops to the main actor and delivers
     /// the callback once per debounce window.
-    private func deliverEvent() {
+    private func deliverEvent(ownerPID: pid_t) {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.pendingDelivery?.cancel()
@@ -131,7 +133,7 @@ final class AccessibilityWindowEventMonitor {
                 try? await Task.sleep(nanoseconds: Self.debounceNanoseconds)
                 guard !Task.isCancelled, let self else { return }
                 self.pendingDelivery = nil
-                self.onEvent?()
+                self.onEvent?(ownerPID)
             }
         }
     }

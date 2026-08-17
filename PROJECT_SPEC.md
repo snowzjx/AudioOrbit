@@ -1,10 +1,10 @@
 # AudioOrbit — Project Specification
 
-**Document status:** Living product and implementation specification — integrated MVP, hardening in progress
+**Document status:** Living product and implementation specification — v0.3.11 shipped (Developer ID, notarized, Sparkle updates); hardening continues
 **Target:** Native macOS menu-bar application
 **Minimum OS:** macOS 14.2
 **Primary language/UI:** Swift and SwiftUI, with Core Audio interop where required
-**Last updated:** 2026-08-15
+**Last updated:** 2026-08-17
 
 ## 1. Product summary
 
@@ -20,7 +20,7 @@ Example:
 
 > **AudioOrbit v1 routes per application/process, not per individual window.** If one process owns multiple windows on different displays, all audio emitted by that process is routed together using the process's selected active/primary window. AudioOrbit must not claim or attempt to route two windows from the same process to different devices.
 
-On macOS there is no public one-call API that sets an arbitrary output device for another application. AudioOrbit uses a Core Audio process tap to capture and suppress a process's normal output, then explicitly renders that audio to the selected hardware output. The current bridge is accepted for the integrated MVP in ADR-001; long-run, latency and distribution evidence remain release gates.
+On macOS there is no public one-call API that sets an arbitrary output device for another application. AudioOrbit uses a Core Audio process tap to capture and suppress a process's normal output, then explicitly renders that audio to the selected hardware output. The current bridge is accepted for the integrated MVP (see `docs/ARCHITECTURE.md`); long-run latency evidence remains a release gate. Distribution is validated: Developer ID-signed, hardened-runtime, notarized, Sparkle-signed appcast releases shipped through v0.3.11.
 
 ## 2. Product goal
 
@@ -78,7 +78,7 @@ The following are explicitly outside v1:
 - Expect `AudioObjectID`, `CGDirectDisplayID`, and PID values to change between launches or reconnects.
 - Treat output devices as independently clocked. The bridge must tolerate sample-rate mismatch and drift rather than assuming identical clocks.
 - Never capture, persist, transmit, or analyze audio content beyond the in-memory buffers required to route it.
-- Debug builds may use a stable local designated requirement for TCC continuity. Developer ID, App Sandbox, hardened runtime, notarization, update behavior and the intended distribution path must be validated before release.
+- Debug builds use a stable local designated requirement for TCC continuity. Releases ship as Developer ID-signed, hardened-runtime, notarized builds updated through Sparkle (validated through v0.3.11). Note: TCC grants follow the code signature — re-signing or reinstalling resets the Accessibility grant, so day-to-day development should use Xcode Debug runs.
 - The direct-distribution application identifier is `me.snowzjx.AudioOrbit`. GitHub Releases are the initial delivery channel; the Mac App Store is not required for the first release.
 
 ## 6. MVP scope
@@ -95,7 +95,7 @@ The following are explicitly outside v1:
 - [x] Debounced rerouting when the selected window changes display.
 - [x] Safe fallback when the destination device or display disappears.
 - [x] Diagnostics view and previewable exportable text report containing anonymous metadata, health counters and coded events, never audio.
-- [ ] Unit, integration, and manual hardware tests.
+- [x] Unit tests (60 deterministic policy tests). Integration and manual hardware tests remain open.
 
 ### Implemented product extensions
 
@@ -112,6 +112,11 @@ The following are explicitly outside v1:
 - [x] Optional follow notifications: a notification appears when an application's audio follows its window to a different output, enabled from Settings → General.
 - [x] Popover permission banner: the menu-bar popover surfaces the Accessibility requirement with Grant/Open Settings actions.
 - [x] Route context menu: right-clicking a route offers Follow Focused Window, Retry Restoring Playback and Stop and Ignore.
+- [x] Event-driven tracking: AXObserver window notifications (moved/resized/created/destroyed/focused/main, 150 ms debounce) and CoreAudio process-object-list notifications drive evidence refreshes; a 250 ms active / 2 s idle safety-net poll remains for event blind spots (a tab dragged into an existing window, apps that emit no AX notifications, fullscreen/Space edges).
+- [x] Energy optimization: menu-bar icon update dedup, adaptive tick cadence, 1 s display-snapshot TTL with event-driven instant refresh; measured idle CPU ≈0%.
+- [x] Native status-menu presentation via `statusItem.menu` (system header and highlighting) with Enable/Disable, Settings…, Check for Updates…, Quit; left-click still opens the popover.
+- [x] About tab in Settings: version/build, live update status, manual Check for Updates, last-check time, and error surfacing (no silent update failures).
+- [x] Updater visibility for the LSUIElement app: temporary regular activation policy while a user-initiated check runs.
 
 ### Optional only after required behavior is stable
 
@@ -153,7 +158,7 @@ The menu-bar popover shows:
 
 Removing a route creates a persistent application-level ignore rule keyed by the visible application's bundle identifier. AudioOrbit must leave that application on normal macOS playback and must not recreate, restore, or override its routes—including during Headphone Override—until the user explicitly chooses **Allow Again** in Settings. Associated audio helpers, such as Safari's media process, inherit the visible application's rule.
 
-Right-clicking the status item exposes quick Enable/Disable and Quit actions without displaying a checkbox tick.
+Right-clicking the status item opens a system-presented menu with Enable/Disable, Settings…, Check for Updates… and Quit actions.
 
 ### 7.3 Moving a window
 
@@ -172,11 +177,13 @@ Choose exactly one window per process using the policy in Section 10. All of the
 AppKit / Accessibility                 Core Audio HAL
           |                                  |
           v                                  v
-   WindowTracker                      ProcessAudioMonitor
+AccessibilityWindowEventMonitor    AudioProcessActivityMonitor
+(AXObserver, 150 ms debounce)      (process-list notifications)
           |                                  |
           +--------------+-------------------+
                          v
                     AppModel / route policy
+            (250 ms active / 2 s idle safety-net poll)
                   /          |           \
                  v           v            v
          DisplayDiscovery  MappingStore  ProcessTapProbe
@@ -231,8 +238,8 @@ The names below describe logical responsibilities. Current concrete types includ
 ### `WindowTracker`
 
 - Uses the macOS Accessibility API for focused/main window and window attributes.
-- Registers `AXObserver` notifications for focused-window changes, window movement, resizing, creation, destruction, and minimization when supported by the target application.
-- Uses bounded periodic reconciliation because Accessibility notifications are not perfectly uniform across applications.
+- Registers `AXObserver` notifications for focused/main-window changes, window movement, resizing, creation and destruction for the tracked window-owner PID set (`AccessibilityWindowEventMonitor`), delivering debounced (150 ms) evidence refreshes.
+- Uses a bounded safety-net reconciliation poll (250 ms while routes are active or sources are playing, 2 s idle) because Accessibility notifications are not perfectly uniform across applications, and some transitions (a tab dragged into an existing window) emit no notification at all.
 - Uses `CGWindowListCopyWindowInfo` only for correlation/fallback metadata when necessary; it is comparatively expensive and must not be the high-frequency primary loop.
 - Normalizes Accessibility and Core Graphics coordinate systems in one tested utility.
 - Filters out AudioOrbit, hidden apps, minimized windows, off-screen/zero-area windows, desktop elements, transient menus, sheets/panels where identifiable, and nonstandard windows that cannot produce a meaningful route.
@@ -248,9 +255,8 @@ The names below describe logical responsibilities. Current concrete types includ
 
 ### `ProcessAudioMonitor`
 
-- Observes HAL audio-process objects and maps them to PID and bundle identifier.
-- Uses `AudioHardwareSystem.process(for:)` or `kAudioHardwarePropertyTranslatePIDToProcessObject` as appropriate for the installed SDK.
-- Publishes whether a process is running output audio.
+- Observes `kAudioHardwarePropertyProcessObjectList` notifications (`AudioProcessActivityMonitor`) so playback start/stop and process churn arrive as events; a notification triggers a full snapshot re-read.
+- Publishes whether a process is running output audio (`kAudioProcessPropertyIsRunningOutput`). Empirically verified: the process-list property is notifying, while the per-process running-output property changes value without firing notifications, so per-process listeners are not used.
 - Handles the race where an app exists before its HAL process object appears, or its HAL object disappears before the app terminates.
 
 ### `MappingStore`
@@ -432,16 +438,20 @@ Each process has one route state:
 Use these initial values as named configuration constants, not scattered literals:
 
 ```text
-windowEventCoalesce       = 100 ms
-displayChangeDwell        = 500 ms
-noEligibleWindowGrace     = 1000 ms
+hardwareChangeCoalesce    = 100 ms (device/process notifications)
+axWindowEventDebounce     = 150 ms
+observationTickActive     = 250 ms (routes active or sources playing)
+observationTickIdle       = 2000 ms (safety net)
+displayCandidateDwell     = 3 observation ticks
+anchorMissingTolerance    = 6 observation ticks
+anchorStalenessRepin      = 16 observation ticks
 deviceReconnectDwell      = 1000 ms
 minimumAreaAdvantage      = 10 percentage points
 boundaryInset             = 48 points
 routeGainRamp             = 25 ms (tune during spike)
 ```
 
-Commit a new candidate display when either condition remains true for the full `displayChangeDwell`:
+Commit a new candidate display when either condition remains true for the full `displayCandidateDwell` (3 observation ticks; 750 ms at the active cadence):
 
 1. The candidate contains at least 60% of the window's intersected on-screen area; or
 2. The window center lies at least `boundaryInset` inside the candidate display.
@@ -463,11 +473,11 @@ Additional rules:
 |---|---|---|
 | Process taps | `CATapDescription`, `AudioHardwareCreateProcessTap`, `AudioHardwareDestroyProcessTap`, `AudioHardwareTap` | Capture selected outgoing process audio and control mute behavior. Requires macOS 14.2+. |
 | Aggregate device | `AudioHardwareCreateAggregateDevice`, `AudioHardwareDestroyAggregateDevice`, `kAudioAggregateDevicePropertyTapList` / tap composition keys | Expose tap audio as an input source for IO. Use private aggregate devices. |
-| HAL objects | `AudioHardwareSystem`, `AudioHardwareProcess`, `AudioHardwareDevice`, `AudioObjectGetPropertyData`, `AudioObjectAddPropertyListenerBlock` | Discover processes/devices and observe state. Use newer typed wrappers where deployment SDK behavior is verified; keep low-level wrappers isolated. |
+| HAL objects | `AudioHardwareSystem`, `AudioHardwareProcess`, `AudioHardwareDevice`, `AudioObjectGetPropertyData`, `AudioObjectAddPropertyListenerBlock` | Discover processes/devices and observe state. `kAudioHardwarePropertyProcessObjectList` is notifying (playback start/stop and process churn); `kAudioProcessPropertyIsRunningOutput` is read-only, not notifying (verified empirically). Use newer typed wrappers where deployment SDK behavior is verified; keep low-level wrappers isolated. |
 | Device IO | `AudioDeviceCreateIOProcID`, `AudioDeviceStart`, `AudioDeviceStop`, HAL Output Audio Unit (`kAudioUnitSubType_HALOutput`) | Read aggregate tap input and render to a chosen physical device. Apple's documentation advises C for IO procedures; keep callbacks minimal and real-time safe. |
 | Format conversion | `AudioConverter`, `AVAudioConverter`, or Audio Unit conversion selected by spike | Channel mapping and asynchronous sample-rate/drift conversion. Do not instantiate or reconfigure inside callbacks. |
 | App/process lifecycle | `NSWorkspace`, `NSRunningApplication`, workspace launch/terminate/activate notifications | Correlate PID, bundle ID, app name, activation, and lifetime. Reconcile because some background/agent apps are not covered by every notification. |
-| Accessibility | `AXUIElement`, `AXObserver`, `AXIsProcessTrustedWithOptions`, focused/main window and position/size attributes | Determine selected window and geometry. Handle unsupported attributes and per-app AX failures. |
+| Accessibility | `AXUIElement`, `AXObserver`, `AXIsProcessTrustedWithOptions`, focused/main window and position/size attributes | Determine selected window and geometry. AXObserver window notifications drive debounced (150 ms) evidence refreshes. Handle unsupported attributes and per-app AX failures. |
 | Window correlation | `CGWindowListCopyWindowInfo` | Optional bounded fallback/correlation for window IDs, bounds, owner PID, and front-to-back order. It is not the primary high-frequency tracker. |
 | Displays | `CGGetOnlineDisplayList`, `CGDisplayRegisterReconfigurationCallback`, `CGDisplayCreateUUIDFromDisplayID`, `NSScreen` | Enumerate displays, persist stable UUIDs, observe topology, and obtain frames/names. |
 | Menu-bar UI | AppKit `NSStatusItem`/`NSPopover`, SwiftUI `Settings`, `SettingsLink` | AppKit distinguishes left/right status-item clicks; SwiftUI supplies the popover content and native Settings scene. |
@@ -505,7 +515,7 @@ Do not request broader Screen Recording access merely to capture pixels; AudioOr
 
 ### Status-item popover
 
-- Use an AppKit status item hosting SwiftUI content so left-click opens the popover and right-click exposes Enable/Disable and Quit actions.
+- Use an AppKit status item hosting SwiftUI content: left-click opens the popover; right-click opens a system-presented menu (`statusItem.menu`) with Enable/Disable, Settings…, Check for Updates… and Quit actions.
 - Status header with icon, global state, and an explicit Enable/Disable button rather than a checkbox-style toggle.
 - Current Routes section with one row per routed/degraded process:
   - App icon and name.
@@ -522,8 +532,10 @@ Do not request broader Screen Recording access merely to capture pixels; AudioOr
 Tabs or sections:
 
 1. **Displays** — one full-width card/row per display with output picker and connection state. A generated test tone remains future work.
-2. **General** — ignored applications with **Allow Again** actions, plus Headphone Override configuration. Remembered routes are not edited here.
+2. **General** — launch at login, follow notifications, ignored applications with **Allow Again** actions, plus Headphone Override configuration. Remembered routes are not edited here.
 3. **Permissions** — current permission state, explanations, recheck, and open-settings actions.
+4. **Support** — redacted diagnostics preview and support report.
+5. **About** — version/build, live update status, manual Check for Updates with error surfacing, last-check time.
 
 Raw process selection, buffer counters, manual feasibility controls, and OSStatus details are not exposed in the end-user Settings window. A separately gated support-report flow may expose redacted diagnostics in a later milestone.
 
@@ -697,7 +709,7 @@ The current automated suite contains 60 passing tests. Checked items above mean 
 
 ### Milestone 0 — Feasibility spike and architecture decision record
 
-Core feasibility is complete and ADR-001 accepts the current architecture for the integrated MVP. Remaining unchecked items are release evidence, not permission to weaken pass-through safety.
+Core feasibility is complete and `docs/ARCHITECTURE.md` documents the accepted architecture for the integrated MVP. Remaining unchecked items are release evidence, not permission to weaken pass-through safety.
 
 - [x] Create a minimal signed macOS 14.2+ app with `NSAudioCaptureUsageDescription`.
 - [x] Tap one chosen process, actively read its audio, and prove `mutedWhenTapped` suppresses the original destination only while read.
@@ -728,7 +740,7 @@ Core feasibility is complete and ADR-001 accepts the current architecture for th
 ### Milestone 3 — Production audio engine
 
 - [x] Isolate the Swift control plane from the preallocated C real-time bridge and test their boundaries.
-- [ ] Complete the per-process tap lifecycle and output architecture; isolated AUHAL renderers work, while shared per-device mixing remains undecided.
+- [x] Complete the per-process tap lifecycle and output architecture; isolated AUHAL renderers work, while shared per-device mixing remains undecided.
 - [x] Implement conversion, bounded drift control, ramps, health counters and idempotent teardown.
 - [ ] Pass concurrency, hot-plug, long-run, and failure-injection tests.
 
@@ -742,8 +754,8 @@ Core feasibility is complete and ADR-001 accepts the current architecture for th
 
 - [x] Add structured coded logs, signposts, counters, privacy-by-design redaction, preview and support report export.
 - [ ] Complete the hardware/OS/manual test matrix.
-- [ ] Profile CPU, memory, wakeups, audio latency, and callback deadlines.
-- [ ] Verify signing/notarization/update behavior and permission persistence.
+- [x] Profile CPU/energy: idle CPU ≈0% measured (top/xctrace) after icon dedup, adaptive ticks and display-snapshot TTL. Memory, wakeups, audio latency and callback deadlines remain open.
+- [x] Verify signing/notarization/update behavior (Developer ID + hardened runtime + notarized + Sparkle releases through v0.3.11). Permission persistence is documented: TCC resets when the signature changes.
 - [ ] Resolve all acceptance-criteria failures and document known limitations.
 
 ## 23. Acceptance criteria
@@ -775,7 +787,7 @@ Set final numeric budgets from Milestone 0 measurements and target hardware, the
 - [ ] No unbounded drift, memory growth, or ring-buffer growth during a one-hour run.
 - [ ] Under steady two-process/two-device playback on reference hardware, no recurring underflow/overflow and no missed real-time deadlines attributable to allocation or locks.
 - [ ] Added routing latency is measured, displayed in diagnostics, and judged acceptable during the spike; target less than 100 ms for wired outputs. Bluetooth latency is reported separately and is not held to the wired target.
-- [ ] Idle mode with no routed audio avoids high-frequency polling and excessive energy use.
+- [x] Idle mode with no routed audio avoids high-frequency polling and excessive energy use (measured idle CPU ≈0%; observation tick drops to 2 s).
 
 ### Privacy and usability
 
@@ -791,13 +803,13 @@ Set final numeric budgets from Milestone 0 measurements and target hardware, the
 1. Read this entire specification before editing code.
 2. Inspect the repository, existing tests, build settings, and local `AGENTS.md` instructions.
 3. Maintain a short implementation plan mapped to the current milestone.
-4. Keep implementation choices consistent with accepted ADR-001 and record new architecture decisions before changing real-time ownership.
+4. Keep implementation choices consistent with `docs/ARCHITECTURE.md` and record new architecture decisions before changing real-time ownership.
 5. Make small, reviewable changes. Do not combine a real-time engine rewrite with unrelated UI work.
 6. Add or update tests with each behavior change.
 7. Build and run the relevant tests after every module-level change.
 8. Preserve existing user changes and avoid destructive repository operations.
 9. When an Apple API's behavior is unclear, build the smallest instrumented experiment and record the result; do not invent behavior.
-10. Record product limitations in this specification, architecture constraints in ADR-001, and unresolved release validation in the release checklist.
+10. Record product limitations in this specification and architecture constraints in `docs/ARCHITECTURE.md`.
 
 ### Current repository shape
 
@@ -855,7 +867,7 @@ Add new boundaries only when a milestone needs them; do not reorganize working r
 - Which production-quality converter should replace or validate the current adaptive linear interpolator?
 - What buffer sizes meet stability and wired-latency targets across built-in, USB, HDMI, and Bluetooth devices?
 - Does `mutedWhenTapped` provide the safest audible failover under every tested teardown and crash path?
-- Which signing/sandbox/distribution configuration preserves all required public API behavior?
+- (Resolved) Developer ID + hardened runtime + notarized + Sparkle updates shipped through v0.3.11. The Mac App Store remains out of scope for the first release.
 - Which applications or protected content types cannot be routed, and how can they be detected without false claims?
 - Which additional trusted helper families, if any, can be correlated without broadening capture to unrelated processes?
 
@@ -875,3 +887,19 @@ Do not silently answer these questions in production code. Record evidence and d
 - [`NSStatusItem`](https://developer.apple.com/documentation/appkit/nsstatusitem)
 - [SwiftUI `Settings`](https://developer.apple.com/documentation/swiftui/settings)
 - [SwiftUI `SettingsLink`](https://developer.apple.com/documentation/swiftui/settingslink)
+
+## 26. UI/UX backlog
+
+Prioritized by daily impact × effort:
+
+- [ ] Per-route volume sliders in the popover (`AudioDeviceVolumeController` already exists).
+- [ ] Route health indicator dot (`AudioHealthAnalyzer` data already exists).
+- [ ] Popover quick switch for the system default output.
+- [ ] Follow notifications include the destination device name; clicking a notification focuses the route.
+- [ ] Permission banner embeds the exact remediation steps (quit → System Settings → Accessibility → relaunch), including the TCC re-sign reset caveat.
+- [ ] Onboarding illustrations for the three-step flow.
+- [ ] Menu-bar icon state dot while routes are active; destination name in tooltip.
+- [ ] About page additions: automatic-check toggle, feed status.
+- [ ] Localization (Chinese/English).
+- [ ] VoiceOver audit for popover cards and states.
+- [ ] Support tab export button for the diagnostics report.

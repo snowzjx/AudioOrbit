@@ -252,6 +252,14 @@ struct AccessibilityWindowDiscovery {
                 stringAttribute(window, kAXIdentifierAttribute as CFString)
             )
             ?? "ax:\(processPID):\(index)"
+        // The media-indicator and renderer-PID walks descend the window's AX
+        // children with several XPC attribute reads per node; they dominated
+        // playback CPU at 4 Hz. Results change only on tab switches or
+        // play-state changes, so cache them briefly per window.
+        let chrome = cachedChromeWalk(
+            identifier: identifier,
+            window: window
+        )
         return WindowCandidateSnapshot(
             stableIdentifier: identifier,
             frame: frame,
@@ -260,9 +268,50 @@ struct AccessibilityWindowDiscovery {
             isMinimized: boolAttribute(window, kAXMinimizedAttribute as CFString) ?? false,
             isNormalWindow: isNormalWindow,
             frontToBackIndex: index,
+            hasMediaIndicator: chrome.hasMediaIndicator,
+            webViewProcessID: chrome.webViewProcessID
+        )
+    }
+
+    private struct ChromeWalkResult {
+        let hasMediaIndicator: Bool
+        let webViewProcessID: pid_t?
+    }
+
+    private final class ChromeWalkCacheEntry {
+        let result: ChromeWalkResult
+        let timestamp: ContinuousClock.Instant
+
+        init(result: ChromeWalkResult, timestamp: ContinuousClock.Instant) {
+            self.result = result
+            self.timestamp = timestamp
+        }
+    }
+
+    /// Chrome walks are cached per stable window identifier for a short TTL.
+    /// NSCache is thread-safe; the evidence path runs on cooperative queues.
+    private static let chromeWalkCache = NSCache<NSString, ChromeWalkCacheEntry>()
+    private static let chromeWalkTTL: Duration = .seconds(2)
+
+    private func cachedChromeWalk(
+        identifier: String,
+        window: AXUIElement
+    ) -> ChromeWalkResult {
+        let key = identifier as NSString
+        let now = ContinuousClock.now
+        if let entry = Self.chromeWalkCache.object(forKey: key),
+           now - entry.timestamp < Self.chromeWalkTTL {
+            return entry.result
+        }
+        let result = ChromeWalkResult(
             hasMediaIndicator: mediaIndicatorFound(in: window, depth: 0),
             webViewProcessID: browserViewProcessID(in: window, depth: 0)
         )
+        Self.chromeWalkCache.setObject(
+            ChromeWalkCacheEntry(result: result, timestamp: now),
+            forKey: key
+        )
+        return result
     }
 
     /// Safari's window identifier embeds volatile page state before a

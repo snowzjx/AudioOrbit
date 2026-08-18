@@ -2412,6 +2412,7 @@ final class AppModel: ObservableObject {
         let start = ContinuousClock.now
         session.metricsTask = Task { [weak self] in
             var didCompleteWarmUp = false
+            var ticksSincePublish = 0
             while !Task.isCancelled {
                 guard let self,
                       let current = self.sessions[routeID],
@@ -2430,7 +2431,9 @@ final class AppModel: ObservableObject {
                     metrics: current.metrics,
                     elapsedSeconds: elapsedSeconds
                 )
-                if current.health.level != current.lastReportedHealthLevel {
+                let healthChanged = current.health.level
+                    != current.lastReportedHealthLevel
+                if healthChanged {
                     current.lastReportedHealthLevel = current.health.level
                     switch current.health.level {
                     case .observing:
@@ -2445,7 +2448,15 @@ final class AppModel: ObservableObject {
                         )
                     }
                 }
-                self.publishRoutes()
+                // Republishing every second re-renders the route UI (and
+                // reloads application icons) continuously during playback.
+                // Publish immediately on health transitions and otherwise
+                // at most every 10 seconds.
+                ticksSincePublish += 1
+                if healthChanged || ticksSincePublish >= 10 {
+                    ticksSincePublish = 0
+                    self.publishRoutes()
+                }
                 try? await Task.sleep(for: .seconds(1))
             }
         }

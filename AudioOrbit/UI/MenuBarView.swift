@@ -233,14 +233,37 @@ struct MenuBarView: View {
         .accessibilityHidden(true)
     }
 
+    /// Application icons are expensive LaunchServices lookups; re-resolving
+    /// them on every SwiftUI re-render dominated playback CPU. Cache by
+    /// bundle identifier (falling back to source PID).
+    private static let applicationIconCache = NSCache<NSString, NSImage>()
+
     private func resolvedApplicationIcon(for route: ProbeRouteSnapshot) -> NSImage? {
+        let cacheKey = route.applicationBundleIdentifier
+            ?? "pid:\(route.sourcePID)"
+        if let cached = Self.applicationIconCache.object(
+            forKey: cacheKey as NSString
+        ) {
+            return cached
+        }
+        let resolved: NSImage?
         if let bundleIdentifier = route.applicationBundleIdentifier,
            let applicationURL = NSWorkspace.shared.urlForApplication(
                withBundleIdentifier: bundleIdentifier
            ) {
-            return NSWorkspace.shared.icon(forFile: applicationURL.path)
+            resolved = NSWorkspace.shared.icon(forFile: applicationURL.path)
+        } else {
+            resolved = NSRunningApplication(
+                processIdentifier: route.sourcePID
+            )?.icon
         }
-        return NSRunningApplication(processIdentifier: route.sourcePID)?.icon
+        if let resolved {
+            Self.applicationIconCache.setObject(
+                resolved,
+                forKey: cacheKey as NSString
+            )
+        }
+        return resolved
     }
 
     private var volumeSection: some View {

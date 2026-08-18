@@ -140,9 +140,12 @@ struct AccessibilityWindowDiscovery {
                 ),
                 focusedWindowIdentifier: candidates.first(where: \.isFocused)?
                     .stableIdentifier,
-                mediaPlayingWindowIdentifiers: candidates.filter(\.hasMediaIndicator)
-                    .map(\.stableIdentifier),
-                webViewProcessIDsByWindow: Self.webViewProcessMap(from: candidates)
+                mediaPlayingWindowIdentifiers: Self.anchorEligibleMediaIdentifiers(
+                    from: candidates
+                ),
+                webViewProcessIDsByWindow: Self.webViewProcessMap(
+                    from: candidates.filter { !$0.isSurfaceOnly }
+                )
             )
         }
 
@@ -173,10 +176,25 @@ struct AccessibilityWindowDiscovery {
             ),
             focusedWindowIdentifier: candidates.first(where: \.isFocused)?
                 .stableIdentifier,
-            mediaPlayingWindowIdentifiers: candidates.filter(\.hasMediaIndicator)
-                .map(\.stableIdentifier),
-            webViewProcessIDsByWindow: Self.webViewProcessMap(from: candidates)
+            mediaPlayingWindowIdentifiers: Self.anchorEligibleMediaIdentifiers(
+                from: candidates
+            ),
+            webViewProcessIDsByWindow: Self.webViewProcessMap(
+                from: candidates.filter { !$0.isSurfaceOnly }
+            ),
+            selectedWindowIsSurfaceOnly: selection.window.isSurfaceOnly
         )
+    }
+
+    /// Media-indicator identifiers that may participate in anchor
+    /// following. Pure surfaces (Safari's fullscreen HTML-video surface)
+    /// are excluded: they may drive the DISPLAY through window selection,
+    /// but must never become the anchor.
+    private static func anchorEligibleMediaIdentifiers(
+        from candidates: [WindowCandidateSnapshot]
+    ) -> [String] {
+        candidates.filter { $0.hasMediaIndicator && !$0.isSurfaceOnly }
+            .map(\.stableIdentifier)
     }
 
     private static func webViewProcessMap(
@@ -192,13 +210,40 @@ struct AccessibilityWindowDiscovery {
         )
     }
 
+    /// The full-desktop CG window scan is expensive and shared across
+    /// sources, so it is cached briefly (1 s) and reused for every PID.
+    private final class SurfaceScanEntry {
+        let windowInfo: [[String: Any]]
+        let timestamp: ContinuousClock.Instant
+
+        init(windowInfo: [[String: Any]], timestamp: ContinuousClock.Instant) {
+            self.windowInfo = windowInfo
+            self.timestamp = timestamp
+        }
+    }
+
+    private static let surfaceScanCache = NSCache<NSString, SurfaceScanEntry>()
+    private static let surfaceScanTTL: Duration = .seconds(1)
+    private static let surfaceScanCacheKey = "scan" as NSString
+
     private func visibleSurfaceCandidates(processPID: pid_t) -> [WindowCandidateSnapshot] {
-        let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
-        guard let windowInfo = CGWindowListCopyWindowInfo(
-            options,
-            kCGNullWindowID
-        ) as? [[String: Any]] else {
-            return []
+        let now = ContinuousClock.now
+        let windowInfo: [[String: Any]]
+        if let entry = Self.surfaceScanCache.object(forKey: Self.surfaceScanCacheKey),
+           now - entry.timestamp < Self.surfaceScanTTL {
+            windowInfo = entry.windowInfo
+        } else {
+            let options: CGWindowListOption = [
+                .optionOnScreenOnly, .excludeDesktopElements,
+            ]
+            windowInfo = CGWindowListCopyWindowInfo(
+                options,
+                kCGNullWindowID
+            ) as? [[String: Any]] ?? []
+            Self.surfaceScanCache.setObject(
+                SurfaceScanEntry(windowInfo: windowInfo, timestamp: now),
+                forKey: Self.surfaceScanCacheKey
+            )
         }
 
         return windowInfo.enumerated().compactMap { index, info in
@@ -227,7 +272,8 @@ struct AccessibilityWindowDiscovery {
                 isMain: false,
                 isMinimized: false,
                 isNormalWindow: true,
-                frontToBackIndex: index
+                frontToBackIndex: index,
+                isSurfaceOnly: true
             )
         }
     }

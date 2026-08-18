@@ -27,6 +27,11 @@ struct WindowCandidateSnapshot: Equatable, Sendable {
     let isMinimized: Bool
     let isNormalWindow: Bool
     let frontToBackIndex: Int
+    /// True for pure Core Graphics surfaces with no matching AX window
+    /// (for example Safari's HTML video fullscreen surface). These inform
+    /// display decisions but must never become the route anchor, which
+    /// belongs to the application's real window.
+    var isSurfaceOnly = false
     var hasMediaIndicator = false
     var webViewProcessID: pid_t?
 }
@@ -51,6 +56,9 @@ struct WindowDisplayEvidence: Equatable, Sendable {
     let focusedWindowIdentifier: String?
     var mediaPlayingWindowIdentifiers: [String] = []
     var webViewProcessIDsByWindow: [String: pid_t] = [:]
+    /// True when the selected window is a pure surface, which may drive the
+    /// display but must never be adopted as the anchor.
+    var selectedWindowIsSurfaceOnly = false
 }
 
 enum WindowDisplayPolicy {

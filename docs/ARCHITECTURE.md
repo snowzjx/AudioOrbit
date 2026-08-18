@@ -73,6 +73,8 @@ Each evidence refresh produces one WindowDisplayEvidence per playing source:
 - **Renderer PID first:** once anchored, the window reporting the anchored renderer PID is the playback window; focus changes never replace the anchor; moving the anchored window across displays migrates the route.
 - **Session boundary:** a stopped→running output transition is a new playback session (anchor released for re-selection), but the release is verified against renderer identity — pausing/resuming the same tab keeps the anchor (pendingSessionRelease), only a genuinely new renderer releases it.
 - **Time constants:** candidate dwell 3 ticks; temporarily missing anchor tolerance 6 ticks; staleness re-pin at 16 ticks; fullscreen/Space transitions keep the last output (anchorIsTemporarilyInvisible).
+- **Surfaces never anchor:** Safari's fullscreen HTML-video surface (`isSurfaceOnly`) is excluded at discovery from the renderer-PID map and the media-indicator list, so no follow path (count==1, dual-report freshness, media fallback, new-window corroboration) can ever adopt it. It still wins window selection and therefore drives the DISPLAY — fullscreen routing works without the anchor moving.
+- **Eventless display changes commit only after a long dwell:** window drags and Space transitions both emit NO AX events — the fallback scan is their only signal. Event-corroborated changes (focus, tear-off, create/destroy) commit immediately; eventless candidates must hold for 3 s. A Space-swipe animation (~1 s) never outlives the dwell, so animated frames cannot commit, while a real drag lands well inside it. Mission Control is additionally caught by the overview hold (area scaling).
 - **Helper-restart migration:** when a WebKit helper vanishes and a same-owner replacement exists, the route migrates to the replacement instead of falling back.
 
 ### 4.4 Process ↔ window association
@@ -115,12 +117,43 @@ Every other Task.sleep is a one-shot timer (100 ms hardware coalescing, 150 ms A
 - Techniques: menu-bar icon update dedup (no per-tick re-render), adaptive tick cadence, 1 s TTL display snapshots with event-driven instant refresh, hardware reconciliation slowed to every 8 ticks while no routes exist.
 - The idle interval is the trade-off between new playback being picked up within ~2 s and wakeup count; playback start itself is already event-driven, so the poll is only the safety net.
 
+### 5.4 Tick-based decisions vs. AX events (audit)
+
+Policy: tick counts are anti-flap debouncers, not detectors — detection is already
+event-driven. Each remaining tick decision is audited for event replacement:
+
+| Decision | Ticks / delay | Defends against | Event replacement | Verdict |
+|---|---|---|---|---|
+| eventlessDisplayCommitDwell | 3 s | Space-swipe animation frames resolving to a neighbor display; transient geometry | Event-corroborated changes commit immediately; eventless candidates (drags, Space swipes — neither emits AX events) must hold 3 s, longer than any transition animation but inside a drag's landing | Event-first + long fallback dwell |
+| noEligibleWindowGrace | 1 s | pass-through during fullscreen entry | **Partial:** a destroyed event commits immediately; fullscreen entry emits none, so the grace stays | Partial |
+| mediaAnchorDwellTicks | 6 | media-indicator alternation between two windows | No: indicator appearance is poll data, not an event | Keep |
+| mediaAnchorMissToleranceTicks | 3 | indicator hiccup starvation | No event exists for "indicator momentarily missing" | Keep |
+| anchoredPIDMissingToleranceTicks | 6 | transient renderer report gaps | The gap is absence of data; the follow itself is corroborated by a brand-new destination or long silence (anchorFollowAllowed). **Destroyed event now skips the tolerance** | Keep + destroy acceleration |
+| anchorFollowNewWindow / LongSilenceTicks | 6 / 48 | MC alternation between fullscreen surface and desktop window; drag alternation between two real windows | Brand-new destination (created event proxy) or very long report silence. Generic owner activity (drag move events, focus changes) deliberately does NOT corroborate — it was legitimizing Safari's drag-time alternation | Event-first |
+| axEventGateWindow / MaximumTicks | 4 / 240 | anchor disappears without events (fullscreen transitions) | Already event-recency discrimination: missing anchor + no events = hold; real transitions fire events and clear it. Space swipes no longer need the gate — the 3 s eventless dwell covers them | Already event-first |
+| anchorStalenessTicks | 16 | re-pin after the anchor vanishes | **Destroyed event now re-pins immediately**; silent disappearance keeps the dwell | Partial |
+| anchorFreshnessAdvantageTicks + freshMediaWindowAgeTicks | 3 / 12 | dual-report freshness arbitration | Ages are poll data; no event exists | Keep |
+| playbackSessionSilenceTicks | 2 | stop→start boundary glitch | The process-table event already triggers the check; the 2-tick wait is anti-glitch | Keep |
+| overviewHoldMaximumTicks | 240 | MC hold backstop | MC emits no events (proven) — the backstop must be time-based | Keep |
+| routeSilenceSuspendSeconds | 60 | suspending silent routes | Frame-level silence counter (C bridge) is ground truth; stop fires the process-table event but pause does not | Keep |
+| hardware coalescing / reconnect / cleanup | 100 ms / 1 s / 1 s | event debounce, retry | Already event-shaped one-shot timers, not polling | N/A |
+| Observation loop | 250 ms / 2 s | safety net (tab-into-existing-window, apps that never emit events) | Spec §1.1 mandates the low-frequency scan stays | Keep |
+
+**Destroyed-event handling:** the AX observer now reports
+`kAXUIElementDestroyedNotification` per debounced batch. A destroyed window is
+gone for real, so the model skips tick-based waiting (stale-anchor dwell,
+missing-renderer tolerance, no-candidate grace) — the event answered what the
+ticks were guessing at. Fullscreen and Mission Control are still guarded by
+the invisibility / overview-hold / event-gate conditions.
+
 ---
 
 ## 6. Key data flows
 
 playback starts:  process-table event → 100 ms coalesce → hardware reconciliation (full snapshot) → evidence refresh → 3-tick dwell → route creation
-window crosses displays:  AX moved → 150 ms debounce → evidence refresh → display assignment change → route migration (validate target → fade out → rebind → fade in)
+window dragged across displays:  no AX events → fallback scan (250 ms) → candidate display change → 3 s eventless dwell → route migration (validate target → fade out → rebind → fade in)
+focus/tear-off change:  AX event → 150 ms debounce → evidence refresh → event-backed commit (no dwell)
+window closed:  AX destroyed → debounce → immediate re-pin / fallback, no staleness dwell
 tab torn out:  AX created → debounce → new window + same WebViewProcessID → anchor follows the new window
 tab dragged into existing window:  no event exists → 2 s safety-net poll → PID↔window mapping recomputed
 pause/resume:  process-table event → reconciliation → renderer identity check (same renderer keeps the anchor / new renderer releases and re-selects)

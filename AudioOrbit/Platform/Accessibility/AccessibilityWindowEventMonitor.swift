@@ -13,12 +13,16 @@ import Foundation
 /// collapses into a single evidence refresh.
 final class AccessibilityWindowEventMonitor {
     /// Debounced delivery of the most recent window event batch, carrying
-    /// the PID of the application that owns the affected window.
-    var onEvent: ((pid_t) -> Void)?
+    /// the PID of the application that owns the affected window and whether
+    /// the batch included a window-destroyed notification. The destroyed
+    /// flag lets the model skip stale-anchor waiting: a window that really
+    /// closed never needs a staleness dwell to be noticed.
+    var onEvent: ((pid_t, Bool) -> Void)?
 
     private var observer: AXObserver?
     private var trackedApplicationPIDs: Set<pid_t> = []
     private var pendingDelivery: Task<Void, Never>?
+    private var pendingBatch: [pid_t: Bool] = [:]
 
     private static let debounceNanoseconds: UInt64 = 150_000_000
 
@@ -39,10 +43,11 @@ final class AccessibilityWindowEventMonitor {
             let monitor = Unmanaged<AccessibilityWindowEventMonitor>
                 .fromOpaque(refcon)
                 .takeUnretainedValue()
-            _ = notification
+            let destroyed =
+                (notification as String) == kAXUIElementDestroyedNotification
             var ownerPID: pid_t = 0
             AXUIElementGetPid(element, &ownerPID)
-            monitor.deliverEvent(ownerPID: ownerPID)
+            monitor.deliverEvent(ownerPID: ownerPID, destroyedSeen: destroyed)
         }
         let result = AXObserverCreate(getpid(), callback, &createdObserver)
         guard result == .success, let createdObserver else {
@@ -116,6 +121,7 @@ final class AccessibilityWindowEventMonitor {
         trackedApplicationPIDs.removeAll()
         pendingDelivery?.cancel()
         pendingDelivery = nil
+        pendingBatch.removeAll()
         self.observer = nil
     }
 
@@ -124,16 +130,25 @@ final class AccessibilityWindowEventMonitor {
     }
 
     /// Called on the AX run-loop thread; hops to the main actor and delivers
-    /// the callback once per debounce window.
-    private func deliverEvent(ownerPID: pid_t) {
+    /// the accumulated batch once per debounce window. A burst of
+    /// notifications (move + resize + focus) collapses into one delivery per
+    /// application, with the destroyed flag OR-ed so a window close inside
+    /// the burst is never lost.
+    private func deliverEvent(ownerPID: pid_t, destroyedSeen: Bool) {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
+            self.pendingBatch[ownerPID] =
+                (self.pendingBatch[ownerPID] ?? false) || destroyedSeen
             self.pendingDelivery?.cancel()
             self.pendingDelivery = Task { [weak self] in
                 try? await Task.sleep(nanoseconds: Self.debounceNanoseconds)
                 guard !Task.isCancelled, let self else { return }
                 self.pendingDelivery = nil
-                self.onEvent?(ownerPID)
+                let batch = self.pendingBatch
+                self.pendingBatch = [:]
+                for (pid, destroyed) in batch {
+                    self.onEvent?(pid, destroyed)
+                }
             }
         }
     }

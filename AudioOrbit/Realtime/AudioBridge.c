@@ -48,6 +48,7 @@ struct AOAudioBridge {
     _Atomic uint64_t renderRequestedFrameCount;
     _Atomic uint64_t capturedFrameCount;
     _Atomic uint64_t renderedFrameCount;
+    _Atomic uint64_t nonSilentFrameCount;
     _Atomic uint64_t consumedSourceFrameCount;
     _Atomic uint64_t maximumQueuedFrameCount;
     _Atomic uint64_t underflowCount;
@@ -361,12 +362,27 @@ void AOAudioBridgeWrite(
         ? requestedFrames
         : availableFrames;
 
+    uint32_t nonSilentFrames = 0;
     for (uint32_t frame = 0; frame < framesToWrite; frame++) {
         const uint32_t ringFrame = (uint32_t)((writeIndex + frame) % bridge->capacityFrames);
+        bool frameHasAudio = false;
         for (uint32_t channel = 0; channel < bridge->channelCount; channel++) {
-            bridge->samples[(size_t)ringFrame * bridge->channelCount + channel] =
-                AOAudioBridgeInputSample(bridge, inputData, frame, channel);
+            const float sample = AOAudioBridgeInputSample(bridge, inputData, frame, channel);
+            bridge->samples[(size_t)ringFrame * bridge->channelCount + channel] = sample;
+            if (sample > 1e-4f || sample < -1e-4f) {
+                frameHasAudio = true;
+            }
         }
+        if (frameHasAudio) {
+            nonSilentFrames++;
+        }
+    }
+    if (nonSilentFrames > 0) {
+        atomic_fetch_add_explicit(
+            &bridge->nonSilentFrameCount,
+            nonSilentFrames,
+            memory_order_relaxed
+        );
     }
 
     atomic_store_explicit(
@@ -732,6 +748,10 @@ AOAudioBridgeSnapshot AOAudioBridgeRead(const AOAudioBridge *bridge) {
     );
     snapshot.renderedFrameCount = atomic_load_explicit(
         &bridge->renderedFrameCount,
+        memory_order_relaxed
+    );
+    snapshot.nonSilentFrameCount = atomic_load_explicit(
+        &bridge->nonSilentFrameCount,
         memory_order_relaxed
     );
     snapshot.consumedSourceFrameCount = atomic_load_explicit(

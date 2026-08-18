@@ -14,6 +14,7 @@ typedef struct AOAudioBridgeSnapshot {
     uint64_t renderRequestedFrameCount;
     uint64_t capturedFrameCount;
     uint64_t renderedFrameCount;
+    uint64_t nonSilentFrameCount;
     uint64_t consumedSourceFrameCount;
     uint64_t queuedFrameCount;
     uint64_t maximumQueuedFrameCount;

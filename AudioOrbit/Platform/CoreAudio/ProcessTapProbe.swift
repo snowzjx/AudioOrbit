@@ -42,6 +42,7 @@ final class ProcessTapProbe {
             renderRequestedFrameCount: bridgeSnapshot.renderRequestedFrameCount,
             capturedFrameCount: bridgeSnapshot.capturedFrameCount,
             renderedFrameCount: bridgeSnapshot.renderedFrameCount,
+            nonSilentFrameCount: bridgeSnapshot.nonSilentFrameCount,
             consumedSourceFrameCount: bridgeSnapshot.consumedSourceFrameCount,
             queuedFrameCount: bridgeSnapshot.queuedFrameCount,
             maximumQueuedFrameCount: bridgeSnapshot.maximumQueuedFrameCount,

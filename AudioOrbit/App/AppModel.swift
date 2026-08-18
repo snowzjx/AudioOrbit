@@ -114,6 +114,7 @@ final class AppModel: ObservableObject {
     private static let overviewHoldMaximumTicks = 240
     private static let axEventGateWindowTicks = 8
     private static let axEventGateMaximumTicks = 240
+    private static let routeSilenceSuspendSeconds = 60
     private static let reconnectDwell = Duration.seconds(1)
     private static let healthWarmUp = Duration.seconds(3)
     private static let displayChangeDwell = Duration.milliseconds(500)
@@ -2413,6 +2414,8 @@ final class AppModel: ObservableObject {
         session.metricsTask = Task { [weak self] in
             var didCompleteWarmUp = false
             var ticksSincePublish = 0
+            var lastNonSilentFrameCount: UInt64 = 0
+            var silentSeconds = 0
             while !Task.isCancelled {
                 guard let self,
                       let current = self.sessions[routeID],
@@ -2457,9 +2460,39 @@ final class AppModel: ObservableObject {
                     ticksSincePublish = 0
                     self.publishRoutes()
                 }
+                // A paused source keeps the renderer alive rendering silence,
+                // which keeps Core Audio's prevent-sleep assertion attached
+                // indefinitely. After a sustained silence the route is torn
+                // down (the anchor and display are retained), so the Mac can
+                // sleep; audio returning rebuilds the route within a second.
+                let nonSilentFrames = current.metrics.nonSilentFrameCount
+                if nonSilentFrames > lastNonSilentFrameCount {
+                    silentSeconds = 0
+                } else {
+                    silentSeconds += 1
+                }
+                lastNonSilentFrameCount = nonSilentFrames
+                if silentSeconds >= Self.routeSilenceSuspendSeconds {
+                    diagnostics.record(
+                        "route-suspended-for-silence",
+                        category: "route"
+                    )
+                    await self.suspendRouteForSilence(routeID)
+                    return
+                }
                 try? await Task.sleep(for: .seconds(1))
             }
         }
+    }
+
+    /// Tears down a running route after sustained silence while keeping the
+    /// automatic-tracking state (anchor, committed display) so returning
+    /// audio re-establishes the route to the same destination.
+    private func suspendRouteForSilence(_ routeID: UUID) async {
+        guard let session = sessions[routeID], session.state == .running else {
+            return
+        }
+        await stopRoute(routeID, preserveAutomaticMode: true)
     }
 
     private func publishRoutes() {

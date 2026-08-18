@@ -50,6 +50,7 @@ struct TapProbeMetrics: Equatable, Sendable {
     var renderRequestedFrameCount: UInt64 = 0
     var capturedFrameCount: UInt64 = 0
     var renderedFrameCount: UInt64 = 0
+    var nonSilentFrameCount: UInt64 = 0
     var consumedSourceFrameCount: UInt64 = 0
     var queuedFrameCount: UInt64 = 0
     var maximumQueuedFrameCount: UInt64 = 0

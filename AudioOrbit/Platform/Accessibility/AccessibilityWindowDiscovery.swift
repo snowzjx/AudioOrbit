@@ -16,6 +16,20 @@ enum AccessibilityPermission {
 }
 
 struct AccessibilityWindowDiscovery {
+    /// A moved AX window can lead the cached Core Graphics snapshot by one
+    /// frame. Discard that snapshot on every AX event so surface matching
+    /// never resolves a fresh AX frame against stale CG bounds.
+    static func invalidateSurfaceScanCache() {
+        surfaceScanCache.removeAllObjects()
+    }
+
+    /// Renderer ownership changes on tab moves and WebKit presentation
+    /// churn. AX events invalidate this short-lived cache so the final event
+    /// in a transition cannot leave a stale renderer mapping behind.
+    static func invalidateWindowMetadataCache() {
+        chromeWalkCache.removeAllObjects()
+    }
+
     func evidence(
         for process: AudioProcessSnapshot,
         windowOwner: WindowOwnerSnapshot,
@@ -23,7 +37,8 @@ struct AccessibilityWindowDiscovery {
         displays: [DisplaySnapshot],
         committedDisplayUUID: UUID? = nil,
         preferredWindowIdentifier: String? = nil,
-        suppressFullscreenPreference: Bool = false
+        preferredRendererPID: pid_t? = nil,
+        allowsUnverifiedFullscreenPresentation: Bool = false
     ) -> WindowDisplayEvidence {
         let application = AXUIElementCreateApplication(windowOwner.pid)
         let focusedWindow = elementAttribute(application, kAXFocusedWindowAttribute as CFString)
@@ -51,6 +66,20 @@ struct AccessibilityWindowDiscovery {
             application,
             kAXWindowsAttribute as CFString
         ) ?? []
+        let windowFramePairs: [(Int, CGRect)] = windows.enumerated().compactMap {
+            index, window -> (Int, CGRect)? in
+            guard let position = pointAttribute(
+                window,
+                kAXPositionAttribute as CFString
+            ), let size = sizeAttribute(
+                window,
+                kAXSizeAttribute as CFString
+            ) else { return nil }
+            return (index, CGRect(origin: position, size: size))
+        }
+        let windowFrames = [Int: CGRect](
+            uniqueKeysWithValues: windowFramePairs
+        )
 
         // Helper processes such as Safari's media service do not expose the
         // browser window that initiated playback. Match the owning app's AX
@@ -61,33 +90,60 @@ struct AccessibilityWindowDiscovery {
         ) ? visibleSurfaceCandidates(processPID: windowOwner.pid) : []
 
         let surfaceAssignments = assignSurfaceIdentifiers(
-            to: windows,
+            to: windowFrames,
             surfaces: surfaceCandidates
         )
-        let accessibilityCandidates = windows.enumerated().compactMap { index, window in
-            candidate(
-                from: window,
-                processPID: windowOwner.pid,
-                index: index,
-                isFocused: focusedWindow.map { CFEqual($0, window) } ?? false,
-                isMain: mainWindow.map { CFEqual($0, window) } ?? false,
-                matchedSurfaceIdentifier: surfaceAssignments[index]
-            )
-        }
+        let assignedSurfaceIdentifiers = Set(surfaceAssignments.values)
+        let requiresOnScreenSurface = WindowRouteAffinityPolicy
+            .pinsInitialWindow(for: associationReason)
+            && !surfaceCandidates.isEmpty
+        let accessibilityCandidates: [WindowCandidateSnapshot] = windows
+            .enumerated().compactMap { index, window in
+                guard let frame = windowFrames[index] else { return nil }
+                let snapshot = candidate(
+                    from: window,
+                    processPID: windowOwner.pid,
+                    index: index,
+                    frame: frame,
+                    isFocused: focusedWindow.map { CFEqual($0, window) } ?? false,
+                    isMain: mainWindow.map { CFEqual($0, window) } ?? false,
+                    matchedSurfaceIdentifier: surfaceAssignments[index]
+                )
+                // Safari may expose AX windows from inactive Spaces. For a
+                // helper route, require a matching on-screen CG surface when
+                // the surface scan is available; a true presentation missing
+                // from AX is recovered by the constrained surface fallback.
+                if requiresOnScreenSurface,
+                   surfaceAssignments[index] == nil {
+                    return nil
+                }
+                return snapshot
+            }
         let candidates: [WindowCandidateSnapshot]
         if WindowDisplayPolicy.selectWindow(
             from: accessibilityCandidates,
             displays: displays,
-            preferredWindowIdentifier: preferredWindowIdentifier
+            preferredWindowIdentifier: preferredWindowIdentifier,
+            preferredRendererPID: preferredRendererPID,
+            allowsUnverifiedFullscreenPresentation:
+                allowsUnverifiedFullscreenPresentation
         ) == nil {
             // Safari's HTML video fullscreen surface is visible at Core
             // Graphics layer 0 but is not consistently exposed as an
-            // AXStandardWindow. Use only same-PID, on-screen application
-            // surfaces and let the existing largest-visible policy select it.
+            // AXStandardWindow. Only an unmatched surface that nearly covers
+            // a display is safe evidence; ordinary Safari windows and their
+            // already-matched surfaces must not take over another route.
             if surfaceCandidates.isEmpty {
                 surfaceCandidates = visibleSurfaceCandidates(processPID: windowOwner.pid)
             }
-            candidates = accessibilityCandidates + surfaceCandidates
+            let fullscreenSurfaces = surfaceCandidates.filter {
+                !assignedSurfaceIdentifiers.contains($0.stableIdentifier)
+                    && WindowDisplayPolicy.isLikelyFullscreenSurface(
+                        $0.frame,
+                        displays: displays
+                    )
+            }
+            candidates = accessibilityCandidates + fullscreenSurfaces
         } else {
             candidates = accessibilityCandidates
         }
@@ -101,28 +157,14 @@ struct AccessibilityWindowDiscovery {
         // the caller — the renderer-PID-tracked playing window; (3)
         // focus/largest as the fallback. Safari's per-window media marker
         // is deliberately NOT used: it follows focus, not playback.
-        var selection: (window: WindowCandidateSnapshot, source: WindowSelectionSource)?
-        // While the user is dragging a window, the dragged (focused)
-        // window must steer the display — the fullscreen presentation
-        // lingers with AXFullScreen=true for a moment after exit and
-        // would otherwise keep pinning the route to the fullscreen
-        // display.
-        if !suppressFullscreenPreference,
-           let fullscreen = candidates.first(where: { candidate in
-               candidate.isFullscreen
-                   && WindowDisplayPolicy.selectWindow(
-                       from: [candidate],
-                       displays: displays
-                   ) != nil
-           }) {
-            selection = (fullscreen, .fullscreen)
-        } else {
-            selection = WindowDisplayPolicy.selectWindow(
-                from: candidates,
-                displays: displays,
-                preferredWindowIdentifier: preferredWindowIdentifier
-            )
-        }
+        let selection = WindowDisplayPolicy.selectWindow(
+            from: candidates,
+            displays: displays,
+            preferredWindowIdentifier: preferredWindowIdentifier,
+            preferredRendererPID: preferredRendererPID,
+            allowsUnverifiedFullscreenPresentation:
+                allowsUnverifiedFullscreenPresentation
+        )
         guard let selection else {
             return WindowDisplayEvidence(
                 sourcePID: process.pid,
@@ -146,9 +188,6 @@ struct AccessibilityWindowDiscovery {
                 ),
                 focusedWindowIdentifier: candidates.first(where: \.isFocused)?
                     .stableIdentifier,
-                mediaPlayingWindowIdentifiers: Self.anchorEligibleMediaIdentifiers(
-                    from: candidates
-                ),
                 webViewProcessIDsByWindow: Self.webViewProcessMap(
                     from: candidates.filter { !$0.isSurfaceOnly }
                 ),
@@ -185,28 +224,13 @@ struct AccessibilityWindowDiscovery {
             ),
             focusedWindowIdentifier: candidates.first(where: \.isFocused)?
                 .stableIdentifier,
-            mediaPlayingWindowIdentifiers: Self.anchorEligibleMediaIdentifiers(
-                from: candidates
-            ),
             webViewProcessIDsByWindow: Self.webViewProcessMap(
                 from: candidates.filter { !$0.isSurfaceOnly }
             ),
             surfaceOnlyWindowIdentifiers: candidates
                 .filter(\.isSurfaceOnly)
-                .map(\.stableIdentifier),
-            selectedWindowIsSurfaceOnly: selection.window.isSurfaceOnly
+                .map(\.stableIdentifier)
         )
-    }
-
-    /// Media-indicator identifiers that may participate in anchor
-    /// following. Pure surfaces (Safari's fullscreen HTML-video surface)
-    /// are excluded: they may drive the DISPLAY through window selection,
-    /// but must never become the anchor.
-    private static func anchorEligibleMediaIdentifiers(
-        from candidates: [WindowCandidateSnapshot]
-    ) -> [String] {
-        candidates.filter { $0.hasMediaIndicator && !$0.isSurfaceOnly }
-            .map(\.stableIdentifier)
     }
 
     private static func webViewProcessMap(
@@ -294,27 +318,29 @@ struct AccessibilityWindowDiscovery {
         from window: AXUIElement,
         processPID: pid_t,
         index: Int,
+        frame: CGRect,
         isFocused: Bool,
         isMain: Bool,
         matchedSurfaceIdentifier: String?
     ) -> WindowCandidateSnapshot? {
-        guard let position = pointAttribute(window, kAXPositionAttribute as CFString),
-              let size = sizeAttribute(window, kAXSizeAttribute as CFString) else { return nil }
         let role = stringAttribute(window, kAXRoleAttribute as CFString)
         let subrole = stringAttribute(window, kAXSubroleAttribute as CFString)
         let isNormalWindow = role == (kAXWindowRole as String)
             && (subrole == nil || subrole == (kAXStandardWindowSubrole as String))
-        let frame = CGRect(origin: position, size: size)
-        let identifier = matchedSurfaceIdentifier
-            ?? Self.stableAXIdentifier(
+        // Safari's AX UUID survives ordinary moves; the CG window number can
+        // be replaced during compositor transitions. Prefer the normalized
+        // AX identity and use the matched surface only for windows that do
+        // not expose a stable AX identifier.
+        let identifier = Self.stableAXIdentifier(
                 stringAttribute(window, kAXIdentifierAttribute as CFString)
             )
+            ?? matchedSurfaceIdentifier
             ?? "ax:\(processPID):\(index)"
-        // The media-indicator and renderer-PID walks descend the window's AX
-        // children with several XPC attribute reads per node; they dominated
-        // playback CPU at 4 Hz. Results change only on tab switches or
-        // play-state changes, so cache them briefly per window.
+        // The renderer-PID walk descends the window's AX children with
+        // several XPC attribute reads per node. Cache it briefly per window;
+        // AX events invalidate the cache on tab/window structural changes.
         let chrome = cachedChromeWalk(
+            processPID: processPID,
             identifier: identifier,
             window: window
         )
@@ -328,13 +354,11 @@ struct AccessibilityWindowDiscovery {
             frontToBackIndex: index,
             isFullscreen: boolAttribute(window, "AXFullScreen" as CFString)
                 ?? false,
-            hasMediaIndicator: chrome.hasMediaIndicator,
             webViewProcessID: chrome.webViewProcessID
         )
     }
 
     private struct ChromeWalkResult {
-        let hasMediaIndicator: Bool
         let webViewProcessID: pid_t?
     }
 
@@ -354,17 +378,17 @@ struct AccessibilityWindowDiscovery {
     private static let chromeWalkTTL: Duration = .seconds(2)
 
     private func cachedChromeWalk(
+        processPID: pid_t,
         identifier: String,
         window: AXUIElement
     ) -> ChromeWalkResult {
-        let key = identifier as NSString
+        let key = "\(processPID):\(identifier)" as NSString
         let now = ContinuousClock.now
         if let entry = Self.chromeWalkCache.object(forKey: key),
            now - entry.timestamp < Self.chromeWalkTTL {
             return entry.result
         }
         let result = ChromeWalkResult(
-            hasMediaIndicator: mediaIndicatorFound(in: window, depth: 0),
             webViewProcessID: browserViewProcessID(in: window, depth: 0)
         )
         Self.chromeWalkCache.setObject(
@@ -382,7 +406,7 @@ struct AccessibilityWindowDiscovery {
     static func stableAXIdentifier(_ raw: String?) -> String? {
         guard let raw, !raw.isEmpty else { return nil }
         guard let range = raw.range(of: "UUID=") else { return raw }
-        let uuid = raw[range.upperBound...]
+        let uuid = raw[range.upperBound...].prefix { $0 != "&" }
         return uuid.isEmpty ? nil : String(uuid)
     }
 
@@ -395,17 +419,12 @@ struct AccessibilityWindowDiscovery {
     /// order and a claimed surface is never reused, so two stacked windows
     /// cannot collapse onto the same window number.
     private func assignSurfaceIdentifiers(
-        to windows: [AXUIElement],
+        to windowFrames: [Int: CGRect],
         surfaces: [WindowCandidateSnapshot]
     ) -> [Int: String] {
         var claimedIdentifiers = Set<String>()
         var assignments: [Int: String] = [:]
-        for (index, window) in windows.enumerated() {
-            guard let position = pointAttribute(window, kAXPositionAttribute as CFString),
-                  let size = sizeAttribute(window, kAXSizeAttribute as CFString) else {
-                continue
-            }
-            let frame = CGRect(origin: position, size: size)
+        for (index, frame) in windowFrames.sorted(by: { $0.key < $1.key }) {
             let frameArea = frame.width * frame.height
             var best: (identifier: String, area: CGFloat)?
             for surface in surfaces
@@ -452,56 +471,6 @@ struct AccessibilityWindowDiscovery {
             }
         }
         return nil
-    }
-
-    /// Detects whether a window's chrome exposes a media-playing indicator,
-    /// such as the mute button Safari places in a tab while that tab plays
-    /// audio. Only window chrome metadata is read — never titles and never
-    /// web content, which the walk explicitly avoids descending into.
-    private static let mediaIndicatorMarkers = [
-        "mute", "unmute", "speaker", "playing", "audio",
-        "静音", "播放", "声音",
-    ]
-
-    private static let mediaMetadataAttributes: [String] = [
-        kAXRoleDescriptionAttribute,
-        kAXSubroleAttribute,
-        kAXIdentifierAttribute,
-        kAXDescriptionAttribute,
-        kAXHelpAttribute,
-    ]
-
-    private func matchesMediaMarker(_ value: String) -> Bool {
-        let lowercased = value.lowercased()
-        return Self.mediaIndicatorMarkers.contains(where: lowercased.contains)
-    }
-    
-    private func mediaIndicatorFound(in element: AXUIElement, depth: Int) -> Bool {
-        guard depth <= 6 else { return false }
-        for name in Self.mediaMetadataAttributes {
-            guard let value = stringAttribute(element, name as CFString) else {
-                continue
-            }
-            if matchesMediaMarker(value) {
-                return true
-            }
-        }
-        let role = (stringAttribute(element, kAXRoleAttribute as CFString) ?? "")
-            .lowercased()
-        if role.contains("webarea") || role.contains("scrollarea")
-            || role.contains("textarea") {
-            return false
-        }
-        guard let children = elementArrayAttribute(
-            element,
-            kAXChildrenAttribute as CFString
-        ) else {
-            return false
-        }
-        for child in children where mediaIndicatorFound(in: child, depth: depth + 1) {
-            return true
-        }
-        return false
     }
 
     private func attribute(_ element: AXUIElement, _ name: CFString) -> CFTypeRef? {

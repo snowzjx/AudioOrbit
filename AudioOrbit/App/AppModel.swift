@@ -1,7 +1,6 @@
 import AppKit
 import CoreAudio
 import Foundation
-import OSLog
 import UniformTypeIdentifiers
 import UserNotifications
 
@@ -39,6 +38,7 @@ final class AppModel: ObservableObject {
         var sourcePID: pid_t
         let sourceName: String
         let audioProcessName: String
+        var audioProcessBundleIdentifier: String?
         let applicationBundleIdentifier: String?
         var sourceObjectID: AudioObjectID
         var destinationDeviceID: AudioObjectID?
@@ -73,6 +73,7 @@ final class AppModel: ObservableObject {
             sourcePID = source.pid
             sourceName = displayedSourceName ?? source.name
             audioProcessName = source.name
+            audioProcessBundleIdentifier = source.bundleIdentifier
             self.applicationBundleIdentifier = applicationBundleIdentifier
                 ?? source.bundleIdentifier
             sourceObjectID = source.id
@@ -96,17 +97,15 @@ final class AppModel: ObservableObject {
         var decisionTask: Task<Void, Never>?
         var silentTickCount = 0
         var anchoredWebViewProcessID: pid_t?
-        var anchoredPIDLastReportedTick = 0
+        var anchoredPIDLastReportedAt: ContinuousClock.Instant?
         var manualAnchorOverride = false
         var commitRetryAttempted = false
+        var candidateRetryNotBefore: ContinuousClock.Instant?
+        var switchRetryCount = 0
         var pendingSessionRelease = false
     }
 
     private static let hardwareChangeCoalescingDelay = Duration.milliseconds(100)
-    /// Recency window for event-corroborated decisions: an AX event
-    /// within this many ticks marks the evidence as backed by a real user
-    /// action (move, focus, create, destroy).
-    private static let eventRecentWindowTicks = 4
     private static let routeSilenceSuspendSeconds = 60
     private static let routeSilenceMigrateSeconds = 3
     private static let routeSilenceMigrateRetrySeconds = 5
@@ -119,9 +118,12 @@ final class AppModel: ObservableObject {
     /// candidate into the queue and restarts the timer, so rapid A-B-A-B
     /// alternation is absorbed at the sink instead of being gated upstream.
     private static let routeSwitchDebounce = Duration.milliseconds(500)
-    /// A renderer that stays unreported for this many ticks is genuinely
-    /// gone (the playing tab closed); shorter gaps are churn transients.
-    private static let anchorLongGapReleaseTicks = 24
+    private static let precomputeInterval: TimeInterval = 4
+    /// A renderer that stays unreported for this duration is genuinely gone
+    /// (the playing tab closed); shorter gaps are churn transients. Wall-clock
+    /// duration is stable even when AX events temporarily accelerate refreshes.
+    private static let anchorLongGapRelease = Duration.seconds(6)
+    private static let failedCandidateRetryCooldown = Duration.seconds(5)
     private static let followNotificationsDefaultsKey = "AudioOrbitFollowNotificationsEnabled"
 
     private let discovery = AudioDiscovery()
@@ -144,17 +146,21 @@ final class AppModel: ObservableObject {
     private var lastDisplayRefreshDate = Date.distantPast
     private var automaticTracking: [pid_t: AutomaticTrackingState] = [:]
     private var automaticRouteIDs: [pid_t: UUID] = [:]
+    private var vanishedSourceGraceTasks: [pid_t: Task<Void, Never>] = [:]
     private var cachedApplicationRoutes: [CachedApplicationRoute] = []
     private var suppressedAutomaticSourcePIDs: Set<pid_t> = []
 
-
-    private var evidenceTickCounter = 0
+    /// Invalidates results from an older AX query batch when a newer window,
+    /// Space or hardware event starts another refresh while the first batch
+    /// is suspended awaiting cross-process Accessibility calls.
+    private var automaticEvidenceRefreshGeneration = 0
+    private var automaticEvidenceRefreshInProgress = false
+    private var automaticEvidenceRefreshPending = false
+    private var automaticEvidenceRefreshPendingForce = false
 
 
 
     private var lastSeenPlayingPIDs: Set<pid_t> = []
-    private var windowFirstSeenTick: [String: Int] = [:]
-    private var lastMovedEventTickByPID: [pid_t: Int] = [:]
     /// Precomputed window→display evidence for applications that exist
     /// but are not currently playing. Recording the mapping while the
     /// process exists (the app's core principle) lets a playback start
@@ -162,12 +168,11 @@ final class AppModel: ObservableObject {
     /// fresh Accessibility round trip.
     private var precomputedEvidenceByOwnerPID: [pid_t: (evidence: WindowDisplayEvidence, at: ContinuousClock.Instant)] = [:]
     private var precomputeTickCounter = 0
+    private var lastPrecomputeDate = Date.distantPast
     private var reportedUnassociatedSourcePIDs: Set<pid_t> = []
     private var reportedSessionEvidenceIssuePIDs: Set<pid_t> = []
     private var applicationActivationObserver: NSObjectProtocol?
     private var spaceChangeObserver: NSObjectProtocol?
-    private var lastKeepLogByPID: [pid_t: String] = [:]
-    private var lastWindowDumpDate: Date?
     private var hasPerformedTerminationCleanup = false
 
     var menuBarSymbol: String {
@@ -265,14 +270,6 @@ final class AppModel: ObservableObject {
             )
         }
         diagnostics.record("launch", category: "application")
-        let launchLogger = Logger(
-            subsystem: Bundle.main.bundleIdentifier
-                ?? "me.snowzjx.AudioOrbit",
-            category: "Anchor"
-        )
-        launchLogger.info(
-            "launch trusted=\(AXIsProcessTrusted(), privacy: .public)"
-        )
         guard startsServices else { return }
         deviceMonitor.onChange = { [weak self] in
             self?.scheduleHardwareReconciliation()
@@ -286,17 +283,26 @@ final class AppModel: ObservableObject {
             // starts are discovered without waiting for the idle poll.
             self?.scheduleHardwareFollowUpChecks()
         }
-        windowEventMonitor.onEvent = { [weak self] ownerPID, movedSeen in
+        windowEventMonitor.onEvent = { [weak self] ownerPID in
             Task { @MainActor [weak self] in
-                self?.noteAXEvent(
-                    ownerPID: ownerPID,
-                    windowMoved: movedSeen
+                AccessibilityWindowDiscovery.invalidateSurfaceScanCache()
+                AccessibilityWindowDiscovery.invalidateWindowMetadataCache()
+                self?.precomputedEvidenceByOwnerPID.removeValue(
+                    forKey: ownerPID
                 )
+                self?.precomputeTickCounter = 3
                 await self?.refreshAutomaticWindowEvidence()
             }
         }
         displayMonitor.onChange = { [weak self] in
-            Task { await self?.refreshWindowEvidence() }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                // A topology callback must bypass the normal one-second
+                // display snapshot throttle and invalidate frame evidence now.
+                self.lastDisplayRefreshDate = .distantPast
+                await self.refreshWindowEvidence()
+                await self.refreshAutomaticWindowEvidence()
+            }
         }
         do {
             try deviceMonitor.start()
@@ -330,12 +336,9 @@ final class AppModel: ObservableObject {
         ) { [weak self] _ in
             Task { @MainActor [weak self] in
                 guard let self else { return }
+                AccessibilityWindowDiscovery.invalidateSurfaceScanCache()
+                AccessibilityWindowDiscovery.invalidateWindowMetadataCache()
                 self.windowEventMonitor.resyncAllWindows()
-                let now = Date()
-                if now.timeIntervalSince(self.lastWindowDumpDate ?? .distantPast) >= 5 {
-                    self.lastWindowDumpDate = now
-                    self.windowEventMonitor.dumpWindowState()
-                }
                 await self.refreshAutomaticWindowEvidence()
             }
         }
@@ -414,13 +417,15 @@ final class AppModel: ObservableObject {
               focusedID != state.committedWindowIdentifier else { return }
         // A manual pin is authoritative: suppress automatic anchor
         // following until the playback session restarts, otherwise the
-        // media-indicator rule would immediately pull the anchor back to
-        // the media window and the audio would snap back.
+        // renderer following would immediately pull the anchor back to the
+        // previous reporter and the audio would snap back.
         state.committedWindowIdentifier = focusedID
         state.manualAnchorOverride = true
-        state.anchoredWebViewProcessID = state.evidence?
-            .webViewProcessIDsByWindow[focusedID]
-            ?? state.anchoredWebViewProcessID
+        if let focusedRendererPID = state.evidence?
+            .webViewProcessIDsByWindow[focusedID] {
+            state.anchoredWebViewProcessID = focusedRendererPID
+            state.anchoredPIDLastReportedAt = .now
+        }
         diagnostics.record("playback-anchor-manual-repin", category: "routing")
         await refreshAutomaticWindowEvidence(forceImmediate: true)
     }
@@ -690,7 +695,13 @@ final class AppModel: ObservableObject {
         // DisplayMonitor reconfiguration callback for instant updates.
         if Date().timeIntervalSince(lastDisplayRefreshDate) >= 1.0 {
             do {
-                displays = try displayDiscovery.snapshots()
+                let refreshedDisplays = try displayDiscovery.snapshots()
+                if refreshedDisplays != displays {
+                    // Cached window frames were resolved against the previous
+                    // display topology and cannot be safely reused.
+                    precomputedEvidenceByOwnerPID.removeAll()
+                }
+                displays = refreshedDisplays
                 synchronizeMappingsWithConnectedHardware()
                 lastDisplayRefreshDate = Date()
             } catch {
@@ -717,6 +728,7 @@ final class AppModel: ObservableObject {
         // display snapshot, the accessibility check, and the observer
         // registrations fresh but does not re-judge the selection on its
         // own cadence.
+        await precomputeWindowMappings()
     }
 
     func startProbe() async {
@@ -788,17 +800,6 @@ final class AppModel: ObservableObject {
         guard let session = sessions[routeID] else { return }
         diagnostics.markRouteTransition()
         diagnostics.record("stop-requested", category: "route")
-        let stopLogger = Logger(
-            subsystem: Bundle.main.bundleIdentifier
-                ?? "me.snowzjx.AudioOrbit",
-            category: "Anchor"
-        )
-        let frames = Thread.callStackSymbols
-        let caller = frames.dropFirst(3).prefix(5)
-            .joined(separator: " | ")
-        stopLogger.info(
-            "stop caller=\(caller, privacy: .public) source=\(session.sourcePID, privacy: .public)"
-        )
         session.cleanupCompletion = completion
         session.cleanupRetryTask?.cancel()
         session.cleanupRetryTask = nil
@@ -1307,7 +1308,35 @@ final class AppModel: ObservableObject {
         forceImmediate: Bool = false
     ) async {
         guard automaticRoutingEnabled else { return }
-        evidenceTickCounter += 1
+        if automaticEvidenceRefreshInProgress {
+            automaticEvidenceRefreshPending = true
+            automaticEvidenceRefreshPendingForce =
+                automaticEvidenceRefreshPendingForce || forceImmediate
+            // The in-flight AX batch predates this request and must not be
+            // applied before the coalesced follow-up refresh.
+            automaticEvidenceRefreshGeneration += 1
+            return
+        }
+
+        automaticEvidenceRefreshInProgress = true
+        var nextForce = forceImmediate
+        repeat {
+            automaticEvidenceRefreshPending = false
+            automaticEvidenceRefreshPendingForce = false
+            await performAutomaticWindowEvidenceRefresh(
+                forceImmediate: nextForce
+            )
+            nextForce = automaticEvidenceRefreshPendingForce
+        } while automaticRoutingEnabled && automaticEvidenceRefreshPending
+        automaticEvidenceRefreshInProgress = false
+    }
+
+    private func performAutomaticWindowEvidenceRefresh(
+        forceImmediate: Bool
+    ) async {
+        guard automaticRoutingEnabled else { return }
+        automaticEvidenceRefreshGeneration += 1
+        let refreshGeneration = automaticEvidenceRefreshGeneration
         let currentlyPlayingPIDs = Set(processes.filter(\.isRunningOutput).map(\.pid))
         if !currentlyPlayingPIDs.isSubset(of: lastSeenPlayingPIDs) {
             diagnostics.record("playing-detected", category: "route")
@@ -1316,27 +1345,42 @@ final class AppModel: ObservableObject {
         suppressedAutomaticSourcePIDs.formIntersection(currentlyPlayingPIDs)
         reportedUnassociatedSourcePIDs.formIntersection(currentlyPlayingPIDs)
         reportedSessionEvidenceIssuePIDs.formIntersection(currentlyPlayingPIDs)
+        let currentPIDs = Set(processes.map(\.pid))
         var windowOwnerPIDs: Set<pid_t> = []
-        let sources = processes.filter { source in
+        let sourceAssociations: [(
+            source: AudioProcessSnapshot,
+            association: ProcessWindowAssociation?
+        )] = processes.compactMap { source in
             let isRelevant = (source.isRunningOutput
                 && !suppressedAutomaticSourcePIDs.contains(source.pid))
                 || automaticRouteIDs[source.pid] != nil
-            guard isRelevant else { return false }
+            guard isRelevant else { return nil }
             let association = processWindowResolver.resolve(source)
-            if let ownerPID = association?.windowOwner.pid {
-                windowOwnerPIDs.insert(ownerPID)
-            }
-            return AutomaticRouteEligibilityPolicy.shouldManage(
+                ?? automaticTracking[source.pid]?.association.map {
+                    ProcessWindowAssociation(
+                        audioProcess: source,
+                        windowOwner: $0.windowOwner,
+                        reason: $0.reason
+                    )
+                }
+            guard AutomaticRouteEligibilityPolicy.shouldManage(
                 source: source,
                 association: association,
                 ignoredBundleIdentifiers: ignoredBundleIdentifiers
-            )
+            ) else { return nil }
+            if let ownerPID = association?.windowOwner.pid {
+                windowOwnerPIDs.insert(ownerPID)
+            }
+            return (source, association)
         }
+        let sources = sourceAssociations.map(\.source)
         windowEventMonitor.setTrackedApplicationPIDs(windowOwnerPIDs)
-        let currentPIDs = Set(processes.map(\.pid))
         let trackedPIDs = Set(automaticTracking.keys).union(automaticRouteIDs.keys)
         let vanishedPIDs = trackedPIDs.filter { !currentPIDs.contains($0) }
         for pid in vanishedPIDs {
+            // One grace coordinator owns the detached state for this PID.
+            // Later refreshes must not race it with a nil-state migration.
+            guard vanishedSourceGraceTasks[pid] == nil else { continue }
             automaticTracking[pid]?.decisionTask?.cancel()
             let trackedState = automaticTracking.removeValue(forKey: pid)
             guard automaticRouteIDs[pid] != nil else { continue }
@@ -1346,11 +1390,15 @@ final class AppModel: ObservableObject {
             // audible stop/start loop. Migrate at once when a replacement
             // already exists; otherwise keep the route and retry for a
             // few seconds before giving up.
-            if let replacement = replacementSource(forVanishedPID: pid),
-               let trackedState {
-                trackedState.wasRunningOutput = true
-                automaticTracking[replacement.pid] = trackedState
-                await migrateAutomaticRoute(fromPID: pid, to: replacement)
+            if let replacement = replacementSource(
+                forVanishedPID: pid,
+                anchoredRendererPID: trackedState?.anchoredWebViewProcessID
+            ) {
+                await migrateAutomaticRoute(
+                    fromPID: pid,
+                    to: replacement,
+                    state: trackedState
+                )
             } else {
                 scheduleVanishedSourceGrace(
                     for: pid,
@@ -1401,14 +1449,22 @@ final class AppModel: ObservableObject {
         // application can otherwise stall the evidence for every other source
         // because Accessibility queries block until their messaging timeout.
         let currentDisplays = displays
+        var sourceCountByOwnerPID: [pid_t: Int] = [:]
+        for request in sourceAssociations {
+            if let ownerPID = request.association?.windowOwner.pid {
+                sourceCountByOwnerPID[ownerPID, default: 0] += 1
+            }
+        }
         let evidenceRequests: [(
             AudioProcessSnapshot,
             ProcessWindowAssociation?,
             UUID?,
             String?,
+            pid_t?,
             Bool
-        )] = sources.map { source in
-                let association = processWindowResolver.resolve(source)
+        )] = sourceAssociations.map { request in
+                let source = request.source
+                let association = request.association
                 if association == nil,
                    source.isRunningOutput,
                    !reportedUnassociatedSourcePIDs.contains(source.pid) {
@@ -1434,17 +1490,30 @@ final class AppModel: ObservableObject {
                 } else {
                     preferredWindowIdentifier = nil
                 }
-                let suppressFullscreenPreference = association.map {
-                    movedRecently(ownerPID: $0.windowOwner.pid)
+                let preferredRendererPID = WindowRouteAffinityPolicy
+                    .preferredRendererPID(
+                        anchoredRendererPID: automaticTracking[source.pid]?
+                            .anchoredWebViewProcessID,
+                        sourcePID: source.pid,
+                        sourceBundleIdentifier: source.bundleIdentifier
+                    )
+                let allowsUnverifiedFullscreenPresentation = association.map {
+                    sourceCountByOwnerPID[$0.windowOwner.pid] == 1
                 } ?? false
                 return (
                     source,
                     association,
                     committedDisplayUUID,
                     preferredWindowIdentifier,
-                    suppressFullscreenPreference
+                    preferredRendererPID,
+                    allowsUnverifiedFullscreenPresentation
                 )
             }
+        var evidenceResults: [(
+            AudioProcessSnapshot,
+            ProcessWindowAssociation?,
+            WindowDisplayEvidence?
+        )] = []
         await withTaskGroup(
             of: (
                 AudioProcessSnapshot,
@@ -1452,13 +1521,22 @@ final class AppModel: ObservableObject {
                 WindowDisplayEvidence?
             ).self
         ) { group in
-            for (source, association, committedDisplayUUID, preferredWindowIdentifier, suppressFullscreenPreference)
+            for (source, association, committedDisplayUUID, preferredWindowIdentifier, preferredRendererPID, allowsUnverifiedFullscreenPresentation)
                 in evidenceRequests {
                 let cachedEvidence: WindowDisplayEvidence?
                 if let association {
                     if let cached = precomputedEvidenceByOwnerPID[
                         association.windowOwner.pid
-                    ], ContinuousClock.now - cached.at < .seconds(2) {
+                    ], ContinuousClock.now - cached.at < .seconds(2),
+                       WindowRouteAffinityPolicy.canReusePrecomputedEvidence(
+                           sourcePID: source.pid,
+                           associationReason: association.reason,
+                           cachedSourcePID: cached.evidence.sourcePID,
+                           cachedAssociationReason: cached.evidence.associationReason,
+                           committedDisplayUUID: committedDisplayUUID,
+                           preferredWindowIdentifier: preferredWindowIdentifier,
+                           preferredRendererPID: preferredRendererPID
+                       ) {
                         cachedEvidence = cached.evidence
                     } else {
                         cachedEvidence = nil
@@ -1478,26 +1556,29 @@ final class AppModel: ObservableObject {
                         displays: currentDisplays,
                         committedDisplayUUID: committedDisplayUUID,
                         preferredWindowIdentifier: preferredWindowIdentifier,
-                        suppressFullscreenPreference: suppressFullscreenPreference
+                        preferredRendererPID: preferredRendererPID,
+                        allowsUnverifiedFullscreenPresentation:
+                            allowsUnverifiedFullscreenPresentation
                     )
                     return (source, association, evidence)
                 }
             }
-            for await (source, association, evidence) in group {
+            for await result in group {
+                evidenceResults.append(result)
+            }
+        }
+        // AppModel is re-entrant while the task group awaits AX. Never let a
+        // completed older batch overwrite the state produced by a newer event.
+        guard refreshGeneration == automaticEvidenceRefreshGeneration else {
+            return
+        }
+        for (source, association, evidence) in evidenceResults {
                 if evidence?.issue != nil,
                    source.isRunningOutput,
-                   automaticRouteIDs[source.pid] != nil
+                    automaticRouteIDs[source.pid] != nil
                        || automaticTracking[source.pid]?.wasRunningOutput == true,
                    !reportedSessionEvidenceIssuePIDs.contains(source.pid) {
                     reportedSessionEvidenceIssuePIDs.insert(source.pid)
-                    let issueLogger = Logger(
-                        subsystem: Bundle.main.bundleIdentifier
-                            ?? "me.snowzjx.AudioOrbit",
-                        category: "Anchor"
-                    )
-                    issueLogger.warning(
-                        "evidence issue pid=\(source.pid, privacy: .public): \(evidence?.issue ?? "unknown", privacy: .public)"
-                    )
                     diagnostics.record(
                         "session-evidence-issue",
                         category: "routing",
@@ -1510,7 +1591,6 @@ final class AppModel: ObservableObject {
                     evidence: evidence,
                     force: forceImmediate
                 )
-            }
         }
 
         updateAutomaticRoutingSummary()
@@ -1575,9 +1655,14 @@ final class AppModel: ObservableObject {
     /// AX and activation events, so moves stay current without a
     /// high-frequency poll.
     private func precomputeWindowMappings() async {
+        let wasNudgedByEvent = precomputeTickCounter >= 3
         precomputeTickCounter += 1
         guard precomputeTickCounter >= 4 else { return }
+        guard wasNudgedByEvent
+                || Date().timeIntervalSince(lastPrecomputeDate)
+                    >= Self.precomputeInterval else { return }
         precomputeTickCounter = 0
+        lastPrecomputeDate = Date()
 
         var ownerPIDs: Set<pid_t> = []
         if let frontmostPID = NSWorkspace.shared.frontmostApplication?
@@ -1606,8 +1691,16 @@ final class AppModel: ObservableObject {
             precomputedEvidenceByOwnerPID.removeValue(forKey: pid)
         }
 
+        let routedOwnerPIDValues: [pid_t] = automaticRouteIDs.keys.compactMap {
+            sourcePID -> pid_t? in
+            guard let source = processes.first(where: { $0.pid == sourcePID }) else {
+                return nil
+            }
+            return processWindowResolver.resolve(source)?.windowOwner.pid
+        }
+        let routedOwnerPIDs = Set(routedOwnerPIDValues)
         for pid in ownerPIDs {
-            guard automaticRouteIDs[pid] == nil,
+            guard !routedOwnerPIDs.contains(pid),
                   let source = processes.first(where: { $0.pid == pid }),
                   !source.isRunningOutput else { continue }
             let association = processWindowResolver.resolve(source)
@@ -1658,10 +1751,6 @@ final class AppModel: ObservableObject {
             // window). Both are managed by the sticky-PID adoption below;
             // nothing else in the decision path may write them.
             let pidMap = evidence.webViewProcessIDsByWindow
-            for identifier in pidMap.keys
-                where windowFirstSeenTick[identifier] == nil {
-                windowFirstSeenTick[identifier] = evidenceTickCounter
-            }
             if state.pendingSessionRelease {
                 state.pendingSessionRelease = false
                 // The playing identity is the RENDERER PID, not the window:
@@ -1674,16 +1763,17 @@ final class AppModel: ObservableObject {
                     category: "routing"
                 )
             }
-            // Long-gap release: only a renderer that stays unreported for
-            // many ticks is genuinely gone. The churn's 1-2 s report gaps
-            // never reach this threshold.
+            // Long-gap release: only a renderer that stays unreported for a
+            // stable wall-clock duration is genuinely gone. AX event bursts
+            // cannot accelerate this timeout during churn.
             if let anchoredPID = state.anchoredWebViewProcessID {
                 if pidMap.values.contains(anchoredPID) {
-                    state.anchoredPIDLastReportedTick = evidenceTickCounter
-                } else if evidenceTickCounter
-                    - state.anchoredPIDLastReportedTick
-                    >= Self.anchorLongGapReleaseTicks {
+                    state.anchoredPIDLastReportedAt = .now
+                } else if let lastReportedAt = state.anchoredPIDLastReportedAt,
+                          ContinuousClock.now - lastReportedAt
+                            >= Self.anchorLongGapRelease {
                     state.anchoredWebViewProcessID = nil
+                    state.anchoredPIDLastReportedAt = nil
                     state.committedWindowIdentifier = nil
                     state.manualAnchorOverride = false
                     diagnostics.record(
@@ -1703,15 +1793,18 @@ final class AppModel: ObservableObject {
             ), source.isRunningOutput {
                 // The anchor is the pair (renderer PID, current reporter).
                 // The PID is STICKY: it is seeded once and released only by
-                // the long-gap rule. The window re-pins every tick to
+                // the long-gap rule. The window re-pins on each refresh to
                 // whichever window reports the PID — tear-offs follow, and
                 // the churn's transient windows merely flip the display
                 // candidate, which the route-side debounce absorbs.
                 let anchorID = state.committedWindowIdentifier
                 if let anchoredPID = state.anchoredWebViewProcessID,
-                   let reporter = pidMap.first(where: {
-                       $0.value == anchoredPID
-                   })?.key {
+                   let reporter = WindowRouteAffinityPolicy
+                       .reporterWindowIdentifier(
+                           rendererPID: anchoredPID,
+                           currentWindowIdentifier: anchorID,
+                           webViewProcessIDsByWindow: pidMap
+                       ) {
                     targetID = reporter != anchorID ? reporter : nil
                 } else if anchorID == nil {
                     // First adoption: seed from the selected window's
@@ -1740,19 +1833,11 @@ final class AppModel: ObservableObject {
                 if state.anchoredWebViewProcessID == nil {
                     // The PID is sticky — never replaced by the window's
                     // own renderer once seeded.
-                    state.anchoredWebViewProcessID = pidMap[targetID]
+                    if let rendererPID = pidMap[targetID] {
+                        state.anchoredWebViewProcessID = rendererPID
+                        state.anchoredPIDLastReportedAt = .now
+                    }
                 }
-                let followedAge = windowFirstSeenTick[targetID]
-                    .map { evidenceTickCounter - $0 }
-                let fromRenderer = pidMap[targetID] != nil
-                let anchorLogger = Logger(
-                    subsystem: Bundle.main.bundleIdentifier
-                        ?? "me.snowzjx.AudioOrbit",
-                    category: "Anchor"
-                )
-                anchorLogger.info(
-                    "follow target=\(targetID, privacy: .public) age=\(followedAge.map(String.init) ?? "never", privacy: .public) fromRenderer=\(fromRenderer ? "yes" : "no", privacy: .public)"
-                )
                 diagnostics.record(
                     "playback-anchor-followed-media-window",
                     category: "routing"
@@ -1761,8 +1846,8 @@ final class AppModel: ObservableObject {
         }
         // The fullscreen surface drives the display by design. It does not
         // have to win window selection: while the anchor is gone (its window
-        // was destroyed by Safari's fullscreen churn) any surface candidate
-        // takes over the display, resolving from its own frame — Safari keeps
+        // was destroyed by Safari's fullscreen churn) one unambiguous,
+        // near-fullscreen surface may take over the display — Safari keeps
         // the hidden desktop window focused, so focus-based selection alone
         // would keep the route pinned to the pre-fullscreen display.
         let surfaceIdentifiers = Set(evidence?.surfaceOnlyWindowIdentifiers ?? [])
@@ -1795,22 +1880,6 @@ final class AppModel: ObservableObject {
             state.hasCandidate = false
             state.decisionTask?.cancel()
             state.decisionTask = nil
-            let issueText = evidence?.issue ?? "none"
-            let committedText = state.committedDisplayUUID.map {
-                String($0.uuidString.prefix(8))
-            } ?? "nil"
-            let keepSignature = "issue=\(issueText) committed=\(committedText)"
-            if lastKeepLogByPID[source.pid] != keepSignature {
-                lastKeepLogByPID[source.pid] = keepSignature
-                let keepLogger = Logger(
-                    subsystem: Bundle.main.bundleIdentifier
-                        ?? "me.snowzjx.AudioOrbit",
-                    category: "Anchor"
-                )
-                keepLogger.warning(
-                    "keep pid=\(source.pid, privacy: .public) \(keepSignature)"
-                )
-            }
             let notice = "The window is transitioning or fullscreen. Keeping the last output."
             if session.notice != notice {
                 session.notice = notice
@@ -1832,9 +1901,27 @@ final class AppModel: ObservableObject {
             state.decisionTask = nil
             return
         }
-        guard effectiveForce || !state.hasCandidate || state.candidateDisplayUUID != candidateDisplayUUID else {
+        let candidateChanged = state.candidateDisplayUUID != candidateDisplayUUID
+        if !effectiveForce, !candidateChanged,
+           let retryNotBefore = state.candidateRetryNotBefore,
+           ContinuousClock.now < retryNotBefore {
             return
         }
+        if effectiveForce || candidateChanged {
+            state.candidateRetryNotBefore = nil
+        } else if state.candidateRetryNotBefore != nil {
+            state.candidateRetryNotBefore = nil
+            state.switchRetryCount = 0
+        }
+        guard effectiveForce || !state.hasCandidate || candidateChanged else {
+            return
+        }
+        if effectiveForce || candidateChanged {
+            state.switchRetryCount = 0
+        }
+        // A retry belongs to one queued candidate. A later candidate (or an
+        // explicit forced re-evaluation) gets its own retry allowance.
+        state.commitRetryAttempted = false
         state.hasCandidate = true
         state.candidateDisplayUUID = candidateDisplayUUID
         state.decisionTask?.cancel()
@@ -1867,19 +1954,35 @@ final class AppModel: ObservableObject {
               state.candidateDisplayUUID == candidateDisplayUUID else { return }
         guard let displayUUID = candidateDisplayUUID,
               let display = displays.first(where: { $0.id == displayUUID }) else {
-            // The decision path NEVER stops a route. Transitional evidence
+            // A nil candidate NEVER stops a route. Transitional evidence
             // gaps (fullscreen churn, Mission Control) must leave
             // established routes alone; vanished sources are handled
-            // exclusively by the vanish-grace machinery.
+            // exclusively by the vanish-grace machinery. (The explicit
+            // pass-through branch below is the one intentional exception:
+            // it honors a user-mapped terminal destination.)
             state.hasCandidate = false
             return
         }
-        state.committedDisplayUUID = displayUUID
+        let mapping = mappings.first { $0.displayUUID == displayUUID }
+        if mapping?.behavior != .routeToDevice {
+            // A connected display with no routed mapping is an explicit
+            // pass-through destination, not a transient evidence gap. Tear
+            // down any existing tap so macOS resumes normal playback.
+            state.commitRetryAttempted = false
+            state.candidateRetryNotBefore = nil
+            state.committedDisplayUUID = displayUUID
+            if automaticRouteIDs[sourcePID] != nil {
+                await stopAutomaticRoute(for: sourcePID)
+            }
+            updateAutomaticRoutingSummary()
+            return
+        }
         guard let source = processes.first(where: { $0.pid == sourcePID }),
               let target = AutomaticRouteTargetPolicy.resolve(
                   source: source,
                   association: state.association,
                   evidence: state.evidence,
+                  displayUUID: displayUUID,
                   displays: displays,
                   mappings: mappings,
                   devices: devices
@@ -1890,8 +1993,8 @@ final class AppModel: ObservableObject {
               let association = state.association else {
             // Target resolution can fail transiently (the media helper is
             // mid-swap, the association is briefly nil, the destination is
-            // reconnecting). The decision path never stops a route, and it
-            // must not drop the commit either: after a drag ends no more
+            // reconnecting). A transient failure must not stop a route or
+            // drop the commit: after a drag ends no more
             // moved events arrive, so a dropped candidate would leave the
             // drag permanently unfollowed. Retry once shortly.
             if !state.commitRetryAttempted {
@@ -1910,10 +2013,21 @@ final class AppModel: ObservableObject {
                         candidateDisplayUUID: displayUUID
                     )
                 }
+            } else {
+                // Do not permanently strand a stable candidate after a
+                // transient association/device failure. Pause periodic
+                // retries briefly, then allow the same evidence to retry.
+                state.commitRetryAttempted = false
+                state.hasCandidate = false
+                state.candidateRetryNotBefore = ContinuousClock.now
+                    + Self.failedCandidateRetryCooldown
+                state.decisionTask = nil
             }
             return
         }
         state.commitRetryAttempted = false
+        state.candidateRetryNotBefore = nil
+        state.committedDisplayUUID = displayUUID
         if let routeID = automaticRouteIDs[sourcePID],
            let session = sessions[routeID] {
             switch RouteLifecyclePolicy.reconciliationAction(
@@ -1934,12 +2048,44 @@ final class AppModel: ObservableObject {
             case .useRunningRoute where session.destinationUID != destination.uid:
                 await switchRoute(routeID, to: destination.id)
                 if session.destinationUID == destination.uid {
+                    state.switchRetryCount = 0
                     session.followedDisplayUUID = display.id
                     session.followedDisplayName = display.name
                     session.notice = "Followed the window to \(display.name)."
                     cacheAutomaticSession(session)
                 } else {
                     state.committedDisplayUUID = session.followedDisplayUUID
+                    if session.state == .running,
+                       let retryNumber = RouteLifecyclePolicy
+                           .nextSwitchRetryNumber(
+                               after: state.switchRetryCount
+                           ) {
+                        state.switchRetryCount = retryNumber
+                        state.hasCandidate = true
+                        state.candidateDisplayUUID = displayUUID
+                        state.decisionTask?.cancel()
+                        state.decisionTask = Task { [weak self] in
+                            try? await Task.sleep(
+                                for: .seconds(retryNumber)
+                            )
+                            guard !Task.isCancelled, let self else { return }
+                            await self.commitAutomaticRoute(
+                                sourcePID: sourcePID,
+                                candidateDisplayUUID: displayUUID
+                            )
+                        }
+                    } else if session.state == .running {
+                        // Cool down instead of suppressing this candidate
+                        // forever. The same stable target may recover after a
+                        // transient Core Audio failure without another move.
+                        state.hasCandidate = false
+                        state.candidateRetryNotBefore = ContinuousClock.now
+                            + Self.failedCandidateRetryCooldown
+                        state.decisionTask = nil
+                    } else {
+                        state.hasCandidate = false
+                        state.decisionTask = nil
+                    }
                 }
                 publishRoutes()
                 updateAutomaticRoutingSummary()
@@ -1985,57 +2131,28 @@ final class AppModel: ObservableObject {
         )
     }
 
-    /// Mission Control scales every visible window simultaneously; a real
-    /// user resize affects a single window. A mass shrink (or a shrink
-    /// combined with a missing anchor) engages a hold that keeps every
-    /// established route on its committed display, because the overview's
-    /// scaled geometry must never migrate a route — the anchor would
-    /// otherwise fall back to another fresh window (for example Safari's
-    /// desktop window behind a fullscreen video) and land on the wrong
-    /// output when Mission Control closes. The hold releases when the
-    /// Records that a window-level AX event arrived for an application.
-    /// Mission Control never emits these, while genuine window moves and
-    /// tab tear-offs do — so event recency is the discriminator between
-    /// overview transforms and real user actions.
-    private func noteAXEvent(ownerPID: pid_t, windowMoved: Bool) {
-        precomputeTickCounter = 3
-        if windowMoved {
-            lastMovedEventTickByPID[ownerPID] = evidenceTickCounter
-        }
-    }
-
-    /// True when the owner recently emitted a window-moved notification:
-    /// the user is actively dragging a window, so the dragged (focused)
-    /// window must steer the display even over a lingering fullscreen
-    /// presentation.
-    private func movedRecently(ownerPID: pid_t) -> Bool {
-        lastMovedEventTickByPID[ownerPID].map {
-            evidenceTickCounter - $0 <= Self.eventRecentWindowTicks
-        } ?? false
-    }
-
-
-
-
-    /// Resolves the display of the largest surface candidate; used when the
-    /// anchor window is gone so the fullscreen surface can drive the display
-    /// without winning window selection.
+    /// Resolves a pure-surface takeover only when all qualifying fullscreen
+    /// surfaces point to one display. Multiple displays are ambiguous (for
+    /// example two Safari presentations) and must retain the existing route.
     private func surfaceDisplayUUID(
         for identifiers: Set<String>,
         evidence: WindowDisplayEvidence?
     ) -> UUID? {
         guard let evidence else { return nil }
-        let frames = identifiers.compactMap { identifier -> CGRect? in
-            evidence.candidateWindowFrames[identifier]
+        let resolvedDisplayIDs: [UUID] = identifiers.compactMap { identifier in
+            guard let frame = evidence.candidateWindowFrames[identifier],
+                  WindowDisplayPolicy.isLikelyFullscreenSurface(
+                      frame,
+                      displays: displays
+                  ) else { return nil }
+            return WindowDisplayPolicy.resolveDisplay(
+                for: frame,
+                displays: displays
+            )?.id
         }
-        let largest = frames.max { lhs, rhs in
-            (lhs.width * lhs.height) < (rhs.width * rhs.height)
-        }
-        guard let largest else { return nil }
-        return WindowDisplayPolicy.resolveDisplay(
-            for: largest,
-            displays: displays
-        )?.id
+        let resolvedDisplays = Set(resolvedDisplayIDs)
+        guard resolvedDisplays.count == 1 else { return nil }
+        return resolvedDisplays.first
     }
 
     private func startAutomaticRoute(
@@ -2105,47 +2222,52 @@ final class AppModel: ObservableObject {
         for vanishedPID: pid_t,
         state: AutomaticTrackingState?
     ) {
+        guard vanishedSourceGraceTasks[vanishedPID] == nil else { return }
         diagnostics.record(
             "route-grace-vanished-source",
             category: "routing",
             level: .warning
         )
-        Task { [weak self] in
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.vanishedSourceGraceTasks[vanishedPID] = nil }
             for delay in [300, 700, 1500, 3000] {
                 try? await Task.sleep(for: .milliseconds(delay))
-                guard !Task.isCancelled, let self else { return }
+                guard !Task.isCancelled else { return }
                 guard self.automaticRouteIDs[vanishedPID] != nil else {
                     return
                 }
                 if let replacement = self.replacementSource(
-                    forVanishedPID: vanishedPID
+                    forVanishedPID: vanishedPID,
+                    anchoredRendererPID: state?.anchoredWebViewProcessID
                 ) {
-                    if let state {
-                        state.wasRunningOutput = true
-                        self.automaticTracking[replacement.pid] = state
-                    }
                     await self.migrateAutomaticRoute(
                         fromPID: vanishedPID,
-                        to: replacement
+                        to: replacement,
+                        state: state
                     )
                     return
                 }
             }
-            guard !Task.isCancelled, let self else { return }
+            guard !Task.isCancelled else { return }
             await self.stopAutomaticRoute(for: vanishedPID)
         }
+        vanishedSourceGraceTasks[vanishedPID] = task
     }
 
     /// Finds a running replacement source for a vanished one: same visible
     /// owner (bundle identifier) via process association, currently
     /// producing output, not already routed and not suppressed.
-    private func replacementSource(forVanishedPID vanishedPID: pid_t) -> AudioProcessSnapshot? {
+    private func replacementSource(
+        forVanishedPID vanishedPID: pid_t,
+        anchoredRendererPID: pid_t? = nil
+    ) -> AudioProcessSnapshot? {
         guard let routeID = automaticRouteIDs[vanishedPID],
               let session = sessions[routeID],
               let ownerBundleIdentifier = session.applicationBundleIdentifier else {
             return nil
         }
-        return processes.first { candidate in
+        let candidates = processes.filter { candidate in
             candidate.isRunningOutput
                 && candidate.pid != vanishedPID
                 && automaticRouteIDs[candidate.pid] == nil
@@ -2154,6 +2276,13 @@ final class AppModel: ObservableObject {
                 && processWindowResolver.resolve(candidate)?.windowOwner
                     .bundleIdentifier == ownerBundleIdentifier
         }
+        return RouteLifecyclePolicy.replacementSource(
+            from: candidates,
+            originalBundleIdentifier: session.audioProcessBundleIdentifier,
+            originalName: session.audioProcessName,
+            anchoredRendererPID: anchoredRendererPID
+                ?? automaticTracking[vanishedPID]?.anchoredWebViewProcessID
+        )
     }
 
     /// Re-parents an automatic route to a replacement source process,
@@ -2162,8 +2291,10 @@ final class AppModel: ObservableObject {
     /// tap re-attach instead of a full stop/recreate cycle.
     private func migrateAutomaticRoute(
         fromPID vanishedPID: pid_t,
-        to replacement: AudioProcessSnapshot
+        to replacement: AudioProcessSnapshot,
+        state detachedState: AutomaticTrackingState? = nil
     ) async {
+        vanishedSourceGraceTasks[vanishedPID]?.cancel()
         guard let routeID = automaticRouteIDs[vanishedPID],
               let session = sessions[routeID],
               let destination = devices.first(where: {
@@ -2191,10 +2322,28 @@ final class AppModel: ObservableObject {
             await stopRoute(routeID, preserveAutomaticMode: true)
             return
         }
+        // Every migration path must move the complete tracking state with the
+        // route. The vanished-source callers may already have detached it;
+        // the silent-helper path leaves it under the old, still-live PID.
+        let trackingState = detachedState
+            ?? automaticTracking.removeValue(forKey: vanishedPID)
+        if let trackingState {
+            if let replacementState = automaticTracking[replacement.pid],
+               replacementState !== trackingState {
+                replacementState.decisionTask?.cancel()
+            }
+            trackingState.wasRunningOutput = true
+            automaticTracking[replacement.pid] = trackingState
+        }
+        // A window-evidence batch may still be querying the old helper PID.
+        // Invalidate it before publishing the replacement key, then request a
+        // fresh batch after the migration completes.
+        automaticEvidenceRefreshGeneration += 1
         automaticRouteIDs.removeValue(forKey: vanishedPID)
         automaticRouteIDs[replacement.pid] = routeID
         session.sourcePID = replacement.pid
         session.sourceObjectID = replacement.id
+        session.audioProcessBundleIdentifier = replacement.bundleIdentifier
         do {
             try session.probe.start(
                 processObjectID: replacement.id,
@@ -2213,9 +2362,13 @@ final class AppModel: ObservableObject {
         }
         updateWatchedDeviceIDs()
         publishRoutes()
+        Task { @MainActor [weak self] in
+            await self?.refreshAutomaticWindowEvidence()
+        }
     }
 
     private func stopAutomaticRoute(for sourcePID: pid_t) async {
+        vanishedSourceGraceTasks[sourcePID]?.cancel()
         guard let routeID = automaticRouteIDs[sourcePID] else { return }
         await stopRoute(routeID, preserveAutomaticMode: true)
     }
@@ -2227,9 +2380,16 @@ final class AppModel: ObservableObject {
     }
 
     private func cancelAutomaticDecisions() {
+        automaticEvidenceRefreshGeneration += 1
+        automaticEvidenceRefreshPending = false
+        automaticEvidenceRefreshPendingForce = false
         for state in automaticTracking.values {
             state.decisionTask?.cancel()
         }
+        for task in vanishedSourceGraceTasks.values {
+            task.cancel()
+        }
+        vanishedSourceGraceTasks.removeAll()
         automaticTracking.removeAll()
     }
 
@@ -2532,8 +2692,11 @@ final class AppModel: ObservableObject {
                 // silent and a same-owner process is actually producing
                 // output, migrate the route to it (retried every few seconds
                 // until the replacement appears).
-                if silentSeconds >= Self.routeSilenceMigrateSeconds,
-                   silentSeconds % Self.routeSilenceMigrateRetrySeconds == 0 {
+                if RouteLifecyclePolicy.shouldAttemptSilentMigration(
+                    silentSeconds: silentSeconds,
+                    firstAttemptAfter: Self.routeSilenceMigrateSeconds,
+                    retryEvery: Self.routeSilenceMigrateRetrySeconds
+                ) {
                     await self.migrateSilentRouteIfReplacementAvailable(routeID)
                 }
                 if silentSeconds >= Self.routeSilenceSuspendSeconds {

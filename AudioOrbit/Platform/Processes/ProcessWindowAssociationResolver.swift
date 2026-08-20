@@ -117,19 +117,29 @@ final class ProcessWindowAssociationResolver {
     /// Either is a valid client for the name-prefix association, which
     /// remains conservative: only the longest unique regular-app prefix is
     /// accepted. The running-app lookup can fail transiently while Safari
-    /// restarts helpers; the Apple-signed bundle identifier alone is then
-    /// enough to trust the process.
+    /// restarts helpers, so proc_pidpath provides a second path lookup; a
+    /// bundle identifier alone is never treated as proof of a system helper.
     private func isSystemWebKitHelper(_ audioProcess: AudioProcessSnapshot) -> Bool {
         guard audioProcess.bundleIdentifier == "com.apple.WebKit.GPU"
                 || audioProcess.bundleIdentifier == "com.apple.WebKit.WebContent"
         else { return false }
-        guard let executableURL = NSRunningApplication(
-            processIdentifier: audioProcess.pid
-        )?.executableURL else {
-            return true
-        }
-        let path = executableURL.standardizedFileURL.path
+        let path = NSRunningApplication(processIdentifier: audioProcess.pid)?
+            .executableURL?.standardizedFileURL.path
+            ?? executablePath(for: audioProcess.pid)
+        guard let path else { return false }
         return path.contains("/System/Library/Frameworks/WebKit.framework/")
+    }
+
+    private func executablePath(for pid: pid_t) -> String? {
+        var buffer = [CChar](
+            repeating: 0,
+            // proc_pidpath requires up to 4 * MAXPATHLEN bytes; the SDK macro
+            // is not imported into Swift.
+            count: 4_096
+        )
+        let length = proc_pidpath(pid, &buffer, UInt32(buffer.count))
+        guard length > 0 else { return nil }
+        return String(cString: buffer)
     }
 
     private func parentPID(of pid: pid_t) -> pid_t? {

@@ -39,7 +39,6 @@ final class UpdateManager: NSObject, ObservableObject {
             status = .failed("The updater is unavailable in this build.")
             return
         }
-        NSLog("[Update] User requested an update check")
         status = .checking
         // Menu actions run while the menu is still tracking; an activation
         // request made from that context is dropped by AppKit, which leaves
@@ -78,23 +77,16 @@ final class UpdateManager: NSObject, ObservableObject {
 }
 
 extension UpdateManager: SPUUpdaterDelegate {
-    func updater(_ updater: SPUUpdater, didFinishLoading appcast: SUAppcast) {
-        NSLog("[Update] Appcast loaded with %d items", appcast.items.count)
-    }
-
     func updater(_ updater: SPUUpdater, didFindValidUpdate item: SUAppcastItem) {
-        NSLog("[Update] Valid update found: %@", item.displayVersionString)
         status = .updateAvailable(version: item.displayVersionString)
     }
 
     func updaterDidNotFindUpdate(_ updater: SPUUpdater, error: Error) {
-        NSLog("[Update] No update found: %@", error.localizedDescription)
         status = .upToDate
         lastCheckedAt = Date()
     }
 
     func updater(_ updater: SPUUpdater, didAbortWithError error: Error) {
-        NSLog("[Update] Update aborted: %@", error.localizedDescription)
         // Sparkle aborts the "no update found" flow with an error whose
         // message is "You're up to date!"; that is not a failure.
         if status != .upToDate, !hasPendingUpdate {
@@ -109,33 +101,14 @@ extension UpdateManager: SPUUpdaterDelegate {
         error: Error?
     ) {
         if let error {
-            NSLog("[Update] Update cycle finished with error: %@", error.localizedDescription)
             // If the flow reported something more specific (up to date,
             // update available, or an abort failure), keep it. Only surface
             // the cycle error when nothing else did.
             if status == .checking {
                 status = .failed(error.localizedDescription)
             }
-        } else {
-            NSLog("[Update] Update cycle finished cleanly")
         }
         lastCheckedAt = Date()
-        NSLog("[Update] Cycle settled, status: %@", statusDescription)
         restoreAccessoryPolicyIfIdle()
-    }
-
-    private var statusDescription: String {
-        switch status {
-        case .idle:
-            return "idle"
-        case .checking:
-            return "checking"
-        case .upToDate:
-            return "upToDate"
-        case .updateAvailable(let version):
-            return "updateAvailable(" + version + ")"
-        case .failed(let message):
-            return "failed(" + message + ")"
-        }
     }
 }

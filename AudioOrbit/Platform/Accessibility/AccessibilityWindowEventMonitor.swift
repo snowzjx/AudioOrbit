@@ -1,6 +1,5 @@
 import ApplicationServices
 import Foundation
-import OSLog
 
 /// Observes window-level accessibility notifications for the applications
 /// whose windows AudioOrbit inspects, so window evidence refreshes are
@@ -35,30 +34,19 @@ import OSLog
 /// into a single evidence refresh per application.
 final class AccessibilityWindowEventMonitor {
     /// Debounced delivery of the most recent window event batch, carrying
-    /// the PID of the application that owns the affected window and whether
-    /// the batch included a window-destroyed notification. The destroyed
-    /// flag lets the model skip stale-anchor waiting: a window that really
-    /// closed never needs a staleness dwell to be noticed.
-    /// (ownerPID, movedSeen)
-    var onEvent: ((pid_t, Bool) -> Void)?
-
-    /// Public-privacy Logger: NSLog would be hidden from 'log show' as
-    /// private data, which silently ate every diagnostic so far.
-    private let logger = Logger(
-        subsystem: Bundle.main.bundleIdentifier ?? "me.snowzjx.AudioOrbit",
-        category: "AXEvents"
-    )
+    /// the PID of the application that owns the affected window.
+    var onEvent: ((pid_t) -> Void)?
 
     /// One AXObserver per observed application: AXObserverCreate's first
     /// parameter is the observed app's PID, so cross-app observation
     /// requires per-app observers.
     private var observersByPID: [pid_t: AXObserver] = [:]
     private var trackedApplicationPIDs: Set<pid_t> = []
+    private var registeredApplicationNotifications: [pid_t: Set<String>] = [:]
     private var registeredWindowElements: [pid_t: [(element: AXUIElement, notifications: [String])]] = [:]
     private var pendingDelivery: Task<Void, Never>?
-    private var pendingBatch: [pid_t: Bool] = [:]
+    private var pendingBatch: Set<pid_t> = []
     private var periodicSyncTask: Task<Void, Never>?
-    private var lastEventLogByKey: [String: Date] = [:]
 
     private static let debounceNanoseconds: UInt64 = 150_000_000
     private static let windowSyncInterval = Duration.seconds(2)
@@ -75,6 +63,7 @@ final class AccessibilityWindowEventMonitor {
     private static let windowNotifications: [String] = [
         kAXWindowMovedNotification,
         kAXWindowResizedNotification,
+        kAXUIElementDestroyedNotification,
     ]
 
     func start() throws {
@@ -89,8 +78,7 @@ final class AccessibilityWindowEventMonitor {
 
     /// Keeps notifications registered for exactly the given application PIDs.
     /// Registration failures (for example while the accessibility permission
-    /// is missing) are tolerated: the model's slow poll still refreshes
-    /// evidence.
+    /// is missing) are tolerated and retried by the periodic window sync.
     func setTrackedApplicationPIDs(_ pids: Set<pid_t>) {
         guard pids != trackedApplicationPIDs else { return }
         for pid in trackedApplicationPIDs.subtracting(pids) {
@@ -115,74 +103,6 @@ final class AccessibilityWindowEventMonitor {
         }
     }
 
-    /// Debug dump of every tracked application's AX windows: role, subrole,
-    /// title, frame, and AXFullScreen — used to learn what Safari's AX tree
-    /// looks like during WebKit video fullscreen.
-    func dumpWindowState() {
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            for pid in self.trackedApplicationPIDs {
-                let application = AXUIElementCreateApplication(pid)
-                var windowsValue: CFTypeRef?
-                guard AXUIElementCopyAttributeValue(
-                    application,
-                    kAXWindowsAttribute as CFString,
-                    &windowsValue
-                ) == .success,
-                    let windows = windowsValue as? [AXUIElement] else {
-                    continue
-                }
-                for (index, window) in windows.enumerated() {
-                    let role = Self.axString(window, kAXRoleAttribute as CFString)
-                        ?? "?"
-                    let subrole = Self.axString(window, kAXSubroleAttribute as CFString)
-                        ?? "-"
-                    let title = Self.axString(window, kAXTitleAttribute as CFString)
-                        ?? "-"
-                    let position = Self.axPoint(window, kAXPositionAttribute as CFString)
-                    let size = Self.axSize(window, kAXSizeAttribute as CFString)
-                    let fullscreen = Self.axBool(window, "AXFullScreen" as CFString)
-                        ?? false
-                    self.logger.info(
-                        "dump pid=\(pid, privacy: .public) #\(index, privacy: .public) role=\(role, privacy: .public) subrole=\(subrole, privacy: .public) title=\(title, privacy: .public) fullscreen=\(fullscreen, privacy: .public) pos=\(position?.debugDescription ?? "-", privacy: .public) size=\(size?.debugDescription ?? "-", privacy: .public)"
-                    )
-                }
-            }
-        }
-    }
-
-    private static func axString(_ element: AXUIElement, _ attribute: CFString) -> String? {
-        var value: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(element, attribute, &value) == .success,
-              let string = value as? String else { return nil }
-        return string
-    }
-
-    private static func axPoint(_ element: AXUIElement, _ attribute: CFString) -> CGPoint? {
-        var value: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(element, attribute, &value) == .success,
-              CFGetTypeID(value) == AXValueGetTypeID() else { return nil }
-        var point = CGPoint.zero
-        guard AXValueGetValue(value as! AXValue, .cgPoint, &point) else { return nil }
-        return point
-    }
-
-    private static func axSize(_ element: AXUIElement, _ attribute: CFString) -> CGSize? {
-        var value: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(element, attribute, &value) == .success,
-              CFGetTypeID(value) == AXValueGetTypeID() else { return nil }
-        var size = CGSize.zero
-        guard AXValueGetValue(value as! AXValue, .cgSize, &size) else { return nil }
-        return size
-    }
-
-    private static func axBool(_ element: AXUIElement, _ attribute: CFString) -> Bool? {
-        var value: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(element, attribute, &value) == .success,
-              CFGetTypeID(value) == CFBooleanGetTypeID() else { return nil }
-        return CFBooleanGetValue(value as! CFBoolean)
-    }
-
     func stop() {
         for pid in trackedApplicationPIDs {
             removeApplicationRegistrations(pid: pid)
@@ -202,22 +122,20 @@ final class AccessibilityWindowEventMonitor {
     /// Called on the AX run-loop thread; hops to the main actor and delivers
     /// the accumulated batch once per debounce window. A burst of
     /// notifications (move + resize + focus) collapses into one delivery per
-    /// application, with the destroyed flag OR-ed so a window close inside
-    /// the burst is never lost.
-    private func deliverEvent(ownerPID: pid_t, movedSeen: Bool) {
+    /// application.
+    private func deliverEvent(ownerPID: pid_t) {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            self.pendingBatch[ownerPID] =
-                (self.pendingBatch[ownerPID] ?? false) || movedSeen
+            self.pendingBatch.insert(ownerPID)
             self.pendingDelivery?.cancel()
             self.pendingDelivery = Task { [weak self] in
                 try? await Task.sleep(nanoseconds: Self.debounceNanoseconds)
                 guard !Task.isCancelled, let self else { return }
                 self.pendingDelivery = nil
                 let batch = self.pendingBatch
-                self.pendingBatch = [:]
-                for (pid, moved) in batch {
-                    self.onEvent?(pid, moved)
+                self.pendingBatch = []
+                for pid in batch {
+                    self.onEvent?(pid)
                 }
             }
         }
@@ -232,7 +150,6 @@ final class AccessibilityWindowEventMonitor {
             .fromOpaque(refcon)
             .takeUnretainedValue()
         let name = notification as String
-        let moved = name == kAXWindowMovedNotification
         var ownerPID: pid_t = 0
         AXUIElementGetPid(element, &ownerPID)
         if ownerPID <= 0 {
@@ -241,11 +158,11 @@ final class AccessibilityWindowEventMonitor {
             ownerPID = monitor.pidForRegisteredElement(element)
         }
         guard ownerPID > 0 else { return }
-        monitor.logEvent(name, pid: ownerPID)
-        if name == kAXWindowCreatedNotification {
+        if name == kAXWindowCreatedNotification
+            || name == kAXUIElementDestroyedNotification {
             monitor.scheduleWindowSync(for: ownerPID)
         }
-        monitor.deliverEvent(ownerPID: ownerPID, movedSeen: moved)
+        monitor.deliverEvent(ownerPID: ownerPID)
     }
 
     /// Creates (or returns) the AXObserver for one observed application.
@@ -258,7 +175,6 @@ final class AccessibilityWindowEventMonitor {
             &created
         )
         guard result == .success, let created else {
-            logger.warning("observer create for pid \(pid, privacy: .public) failed: \(result.rawValue, privacy: .public)")
             return nil
         }
         CFRunLoopAddSource(
@@ -270,11 +186,14 @@ final class AccessibilityWindowEventMonitor {
         return created
     }
 
-    private func addApplicationRegistrations(pid: pid_t) {
-        guard let observer = observer(for: pid) else { return }
+    @discardableResult
+    private func addApplicationRegistrations(pid: pid_t) -> Bool {
+        guard let observer = observer(for: pid) else { return false }
         let application = AXUIElementCreateApplication(pid)
-        var succeeded = 0
-        for notification in Self.applicationNotifications {
+        var registered = registeredApplicationNotifications[pid] ?? []
+        var didRegister = false
+        for notification in Self.applicationNotifications
+            where !registered.contains(notification) {
             let result = AXObserverAddNotification(
                 observer,
                 application,
@@ -282,24 +201,29 @@ final class AccessibilityWindowEventMonitor {
                 Unmanaged.passUnretained(self).toOpaque()
             )
             if result == .success {
-                succeeded += 1
-            } else {
-                logger.warning("observe \(notification, privacy: .public) on pid \(pid, privacy: .public) failed: \(result.rawValue, privacy: .public)")
+                registered.insert(notification)
+                didRegister = true
             }
         }
-        logger.info("app registrations pid=\(pid, privacy: .public) ok=\(succeeded, privacy: .public)")
+        registeredApplicationNotifications[pid] = registered
+        return didRegister
     }
 
     private func removeApplicationRegistrations(pid: pid_t) {
-        guard let observer = observersByPID[pid] else { return }
+        guard let observer = observersByPID[pid] else {
+            registeredApplicationNotifications[pid] = nil
+            registeredWindowElements[pid] = nil
+            return
+        }
         let application = AXUIElementCreateApplication(pid)
-        for notification in Self.applicationNotifications {
+        for notification in registeredApplicationNotifications[pid] ?? [] {
             AXObserverRemoveNotification(
                 observer,
                 application,
                 notification as CFString
             )
         }
+        registeredApplicationNotifications[pid] = nil
         for entry in registeredWindowElements[pid] ?? [] {
             for notification in entry.notifications {
                 AXObserverRemoveNotification(
@@ -321,6 +245,7 @@ final class AccessibilityWindowEventMonitor {
     /// Re-enumerates the application's AX windows and makes the per-window
     /// registrations match. Runs on the main queue.
     private func syncWindowObservers(for pid: pid_t) {
+        var didChange = addApplicationRegistrations(pid: pid)
         guard let observer = observersByPID[pid] else { return }
         let application = AXUIElementCreateApplication(pid)
         var windowsValue: CFTypeRef?
@@ -328,20 +253,13 @@ final class AccessibilityWindowEventMonitor {
             application,
             kAXWindowsAttribute as CFString,
             &windowsValue
-        ) == .success else {
-            logger.warning("window sync pid=\(pid, privacy: .public): windows attribute failed")
-            return
-        }
-        guard let windows = windowsValue as? [AXUIElement] else {
-            logger.warning("window sync pid=\(pid, privacy: .public): cast failed")
-            return
-        }
-        logger.info("window sync pid=\(pid, privacy: .public): \(windows.count, privacy: .public) windows")
+        ) == .success else { return }
+        guard let windows = windowsValue as? [AXUIElement] else { return }
+        let previous = registeredWindowElements[pid] ?? []
         var next: [(element: AXUIElement, notifications: [String])] = []
-        for entry in registeredWindowElements[pid] ?? [] {
-            if windows.contains(where: { CFEqual($0, entry.element) }) {
-                next.append(entry)
-            } else {
+        for entry in previous
+            where !windows.contains(where: { CFEqual($0, entry.element) }) {
+                didChange = true
                 for notification in entry.notifications {
                     AXObserverRemoveNotification(
                         observer,
@@ -349,14 +267,17 @@ final class AccessibilityWindowEventMonitor {
                         notification as CFString
                     )
                 }
-            }
         }
         for window in windows {
-            guard !next.contains(where: { CFEqual($0.element, window) }) else {
-                continue
+            let previousEntry = previous.first {
+                CFEqual($0.element, window)
             }
-            var registered: [String] = []
-            for notification in Self.windowNotifications {
+            var registered = previousEntry?.notifications ?? []
+            if previousEntry == nil {
+                didChange = true
+            }
+            for notification in Self.windowNotifications
+                where !registered.contains(notification) {
                 let result = AXObserverAddNotification(
                     observer,
                     window,
@@ -365,13 +286,15 @@ final class AccessibilityWindowEventMonitor {
                 )
                 if result == .success {
                     registered.append(notification)
-                } else {
-                    logger.warning("observe \(notification, privacy: .public) on a window of pid \(pid, privacy: .public) failed: \(result.rawValue, privacy: .public)")
+                    didChange = true
                 }
             }
             next.append((window, registered))
         }
         registeredWindowElements[pid] = next
+        if didChange {
+            deliverEvent(ownerPID: pid)
+        }
     }
 
     private func scheduleWindowSync(for pid: pid_t) {
@@ -382,15 +305,12 @@ final class AccessibilityWindowEventMonitor {
 
     private func startPeriodicWindowSync() {
         periodicSyncTask?.cancel()
-        periodicSyncTask = Task { [weak self] in
+        periodicSyncTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: Self.windowSyncInterval)
-                guard !Task.isCancelled else { return }
-                DispatchQueue.main.async { [weak self] in
-                    guard let self else { return }
-                    for pid in self.trackedApplicationPIDs {
-                        self.syncWindowObservers(for: pid)
-                    }
+                guard !Task.isCancelled, let self else { return }
+                for pid in self.trackedApplicationPIDs {
+                    self.syncWindowObservers(for: pid)
                 }
             }
         }
@@ -405,17 +325,6 @@ final class AccessibilityWindowEventMonitor {
         return 0
     }
 
-    /// Rate-limited (once per second per pid+type) event logging so drags
-    /// are diagnosable without flooding the unified log.
-    private func logEvent(_ name: String, pid: pid_t) {
-        let key = "\(pid):\(name)"
-        let now = Date()
-        if let last = lastEventLogByKey[key], now.timeIntervalSince(last) < 1 {
-            return
-        }
-        lastEventLogByKey[key] = now
-        logger.info("\(name, privacy: .public) pid=\(pid, privacy: .public)")
-    }
 }
 
 enum AccessibilityEventMonitorError: Error, CustomStringConvertible {
@@ -428,4 +337,3 @@ enum AccessibilityEventMonitorError: Error, CustomStringConvertible {
         }
     }
 }
-

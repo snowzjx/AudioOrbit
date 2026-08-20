@@ -34,12 +34,13 @@ enum AutomaticRouteTargetPolicy {
         source: AudioProcessSnapshot,
         association: ProcessWindowAssociation?,
         evidence: WindowDisplayEvidence?,
+        displayUUID explicitDisplayUUID: UUID? = nil,
         displays: [DisplaySnapshot],
         mappings: [DisplayAudioMapping],
         devices: [AudioDeviceSnapshot]
     ) -> AutomaticRouteTarget? {
         guard let association,
-              let displayUUID = evidence?.displayUUID,
+              let displayUUID = explicitDisplayUUID ?? evidence?.displayUUID,
               let display = displays.first(where: { $0.id == displayUUID }),
               let mapping = mappings.first(where: { $0.displayUUID == displayUUID }),
               mapping.behavior == .routeToDevice,

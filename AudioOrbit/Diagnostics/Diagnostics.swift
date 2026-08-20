@@ -56,7 +56,10 @@ final class DiagnosticsRecorder: @unchecked Sendable {
 
         switch level {
         case .info:
-            logger.info("\(category, privacy: .public).\(code, privacy: .public)")
+            // Routine activity stays only in the bounded in-memory support
+            // report. Do not persist playback/routing behavior to macOS's
+            // unified log by default.
+            break
         case .warning:
             logger.warning("\(category, privacy: .public).\(code, privacy: .public)")
         case .error:

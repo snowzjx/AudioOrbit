@@ -203,6 +203,41 @@ final class ProcessWindowAssociationTests: XCTestCase {
         XCTAssertEqual(Set(targets.map(\.destinationDeviceUID)), ["left-output", "right-output"])
     }
 
+    func testExplicitCandidateDisplayResolvesWithoutSelectedWindowDisplay() throws {
+        let leftID = UUID(uuidString: "00000000-0000-0000-0000-000000000001")!
+        let rightID = UUID(uuidString: "00000000-0000-0000-0000-000000000002")!
+        let displays = [
+            display(id: leftID, name: "Left"),
+            display(id: rightID, name: "Fullscreen"),
+        ]
+        let devices = [
+            device(id: 10, uid: "left-output"),
+            device(id: 20, uid: "fullscreen-output"),
+        ]
+        let source = audioProcess(pid: 220, bundle: "webkit", name: "Safari Media")
+        let association = ProcessWindowAssociation(
+            audioProcess: source,
+            windowOwner: application(pid: 200, bundle: "safari", name: "Safari"),
+            reason: .parentApplication
+        )
+
+        let target = try XCTUnwrap(AutomaticRouteTargetPolicy.resolve(
+            source: source,
+            association: association,
+            evidence: nil,
+            displayUUID: rightID,
+            displays: displays,
+            mappings: [
+                mapping(displayID: leftID, device: devices[0]),
+                mapping(displayID: rightID, device: devices[1]),
+            ],
+            devices: devices
+        ))
+
+        XCTAssertEqual(target.displayUUID, rightID)
+        XCTAssertEqual(target.destinationDeviceUID, "fullscreen-output")
+    }
+
     private func audioProcess(
         pid: pid_t,
         bundle: String,

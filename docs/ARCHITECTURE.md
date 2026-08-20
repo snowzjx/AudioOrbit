@@ -1,6 +1,6 @@
 # AudioOrbit Architecture
 
-**Version:** 0.5.0 (build 23, unreleased) · **Updated:** 2026-08-20
+**Version:** 0.5.0-beta (build 23) · **Updated:** 2026-08-20
 **Scope:** This is the single architecture document for AudioOrbit. It supersedes ADR-001 and the performance budgets document.
 
 ---

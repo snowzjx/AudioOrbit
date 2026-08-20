@@ -332,7 +332,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 0.4.0;
+				MARKETING_VERSION = 0.5.0;
 				OTHER_CODE_SIGN_FLAGS = "--requirements '=designated => identifier \"me.snowzjx.AudioOrbit\" and info[AudioOrbitLocalDevelopmentIdentity] = \"4C4776C5-86E0-4CB7-94DA-EAA234293C3D\"'";
 				PRODUCT_BUNDLE_IDENTIFIER = me.snowzjx.AudioOrbit;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -358,7 +358,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 0.4.0;
+				MARKETING_VERSION = 0.5.0;
 				PRODUCT_BUNDLE_IDENTIFIER = me.snowzjx.AudioOrbit;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = YES;

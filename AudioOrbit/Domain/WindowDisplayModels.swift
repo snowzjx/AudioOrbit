@@ -12,6 +12,7 @@ struct DisplaySnapshot: Identifiable, Equatable, Sendable {
 }
 
 enum WindowSelectionSource: String, Equatable, Sendable {
+    case fullscreen = "Fullscreen window"
     case focused = "Focused window"
     case main = "Main window"
     case largestVisible = "Largest visible window"
@@ -27,6 +28,9 @@ struct WindowCandidateSnapshot: Equatable, Sendable {
     let isMinimized: Bool
     let isNormalWindow: Bool
     let frontToBackIndex: Int
+    /// True when the window reports kAXFullscreenAttribute — Safari's
+    /// fullscreen presentation (green button or WebKit video fullscreen).
+    var isFullscreen = false
     /// True for pure Core Graphics surfaces with no matching AX window
     /// (for example Safari's HTML video fullscreen surface). These inform
     /// display decisions but must never become the route anchor, which
@@ -56,6 +60,11 @@ struct WindowDisplayEvidence: Equatable, Sendable {
     let focusedWindowIdentifier: String?
     var mediaPlayingWindowIdentifiers: [String] = []
     var webViewProcessIDsByWindow: [String: pid_t] = [:]
+    /// Identifiers of pure-surface candidates (Safari's fullscreen video
+    /// surface): they may drive the display but never the anchor, and they
+    /// are excluded from Mission Control's overview detection because the
+    /// fullscreen-exit animation legitimately shrinks them.
+    var surfaceOnlyWindowIdentifiers: [String] = []
     /// True when the selected window is a pure surface, which may drive the
     /// display but must never be adopted as the anchor.
     var selectedWindowIsSurfaceOnly = false
@@ -68,7 +77,10 @@ enum WindowDisplayPolicy {
         preferredWindowIdentifier: String? = nil
     ) -> (window: WindowCandidateSnapshot, source: WindowSelectionSource)? {
         let eligible = candidates.filter { candidate in
-            guard candidate.isNormalWindow,
+            // Safari's fullscreen presentation is an AXDialog (non-standard
+            // subrole) with AXFullScreen=true; it must be eligible so the
+            // fullscreen preference below can drive the display.
+            guard (candidate.isNormalWindow || candidate.isFullscreen),
                   !candidate.isMinimized,
                   candidate.frame.width > 0,
                   candidate.frame.height > 0 else { return false }
@@ -79,6 +91,12 @@ enum WindowDisplayPolicy {
             return eligible.first {
                 $0.stableIdentifier == preferredWindowIdentifier
             }.map { ($0, .routeAnchor) }
+        }
+
+        // A fullscreen window (Safari's fullscreen presentation)
+        // dominates the user's attention: it wins over focus.
+        if let fullscreen = eligible.first(where: \.isFullscreen) {
+            return (fullscreen, .fullscreen)
         }
 
         if let focused = eligible.first(where: \.isFocused) {
@@ -146,15 +164,6 @@ enum WindowRouteAffinityPolicy {
         reason != .sameProcess
     }
 
-    static func routeAnchor(
-        existing: String?,
-        selected: String?,
-        associationReason: ProcessWindowAssociationReason
-    ) -> String? {
-        guard pinsInitialWindow(for: associationReason) else { return nil }
-        return existing ?? selected
-    }
-
     static func beginsNewPlaybackSession(
         wasRunningOutput: Bool?,
         isRunningOutput: Bool,
@@ -166,26 +175,6 @@ enum WindowRouteAffinityPolicy {
             && silenceTicks >= requiredSilenceTicks
     }
 
-    /// Chooses the media window to follow. A single media window is the
-    /// obvious target. With several, the freshest one wins: a torn-off tab
-    /// lands in a freshly created window whose identifier age is small,
-    /// while the source window's stale indicator keeps a large age. Old
-    /// simultaneous playback stays ambiguous and is left alone.
-    static func bestMediaTarget(
-        _ mediaIdentifiers: Set<String>,
-        ages: [String: Int],
-        freshWindowAgeTicks: Int
-    ) -> String? {
-        if mediaIdentifiers.count == 1 {
-            return mediaIdentifiers.first
-        }
-        guard mediaIdentifiers.count > 1 else { return nil }
-        let minimumAge = mediaIdentifiers.map { ages[$0] ?? 0 }.min() ?? 0
-        let freshest = mediaIdentifiers.filter { (ages[$0] ?? 0) == minimumAge }
-        guard freshest.count == 1,
-              minimumAge <= freshWindowAgeTicks else { return nil }
-        return freshest.first
-    }
 }
 
 enum DisplayTransitionPolicy {

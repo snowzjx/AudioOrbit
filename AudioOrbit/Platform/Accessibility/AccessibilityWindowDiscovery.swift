@@ -22,7 +22,8 @@ struct AccessibilityWindowDiscovery {
         associationReason: ProcessWindowAssociationReason,
         displays: [DisplaySnapshot],
         committedDisplayUUID: UUID? = nil,
-        preferredWindowIdentifier: String? = nil
+        preferredWindowIdentifier: String? = nil,
+        suppressFullscreenPreference: Bool = false
     ) -> WindowDisplayEvidence {
         let application = AXUIElementCreateApplication(windowOwner.pid)
         let focusedWindow = elementAttribute(application, kAXFocusedWindowAttribute as CFString)
@@ -94,28 +95,33 @@ struct AccessibilityWindowDiscovery {
             WindowDisplayPolicy.selectWindow(from: [$0], displays: displays) != nil
         }.count
 
-        var selection = WindowDisplayPolicy.selectWindow(
-            from: candidates,
-            displays: displays,
-            preferredWindowIdentifier: preferredWindowIdentifier
-        )
-        // Safari marks the playing tab's window with a per-window audio
-        // indicator in its chrome. When the anchor did not match, prefer
-        // that window over focus/largest-visible so a video that starts in
-        // a background window still routes to the right display. Chrome
-        // controls replicated across every window of an app never trigger
-        // this, because the rule requires exactly one matching window.
-        if selection?.source != .routeAnchor {
-            let mediaCandidates = candidates.filter(\.hasMediaIndicator)
-            if mediaCandidates.count == 1,
-               let mediaWindow = mediaCandidates.first,
-               mediaWindow.stableIdentifier != selection?.window.stableIdentifier,
-               WindowDisplayPolicy.selectWindow(
-                   from: [mediaWindow],
-                   displays: displays
-               ) != nil {
-                selection = (mediaWindow, .mediaIndicator)
-            }
+        // The audio follows the window the video plays in — not focus.
+        // Priority: (1) the fullscreen presentation (AXFullScreen=true, the
+        // WebKit fullscreen AXDialog); (2) the preferred window supplied by
+        // the caller — the renderer-PID-tracked playing window; (3)
+        // focus/largest as the fallback. Safari's per-window media marker
+        // is deliberately NOT used: it follows focus, not playback.
+        var selection: (window: WindowCandidateSnapshot, source: WindowSelectionSource)?
+        // While the user is dragging a window, the dragged (focused)
+        // window must steer the display — the fullscreen presentation
+        // lingers with AXFullScreen=true for a moment after exit and
+        // would otherwise keep pinning the route to the fullscreen
+        // display.
+        if !suppressFullscreenPreference,
+           let fullscreen = candidates.first(where: { candidate in
+               candidate.isFullscreen
+                   && WindowDisplayPolicy.selectWindow(
+                       from: [candidate],
+                       displays: displays
+                   ) != nil
+           }) {
+            selection = (fullscreen, .fullscreen)
+        } else {
+            selection = WindowDisplayPolicy.selectWindow(
+                from: candidates,
+                displays: displays,
+                preferredWindowIdentifier: preferredWindowIdentifier
+            )
         }
         guard let selection else {
             return WindowDisplayEvidence(
@@ -145,7 +151,10 @@ struct AccessibilityWindowDiscovery {
                 ),
                 webViewProcessIDsByWindow: Self.webViewProcessMap(
                     from: candidates.filter { !$0.isSurfaceOnly }
-                )
+                ),
+                surfaceOnlyWindowIdentifiers: candidates
+                    .filter(\.isSurfaceOnly)
+                    .map(\.stableIdentifier)
             )
         }
 
@@ -182,6 +191,9 @@ struct AccessibilityWindowDiscovery {
             webViewProcessIDsByWindow: Self.webViewProcessMap(
                 from: candidates.filter { !$0.isSurfaceOnly }
             ),
+            surfaceOnlyWindowIdentifiers: candidates
+                .filter(\.isSurfaceOnly)
+                .map(\.stableIdentifier),
             selectedWindowIsSurfaceOnly: selection.window.isSurfaceOnly
         )
     }
@@ -314,6 +326,8 @@ struct AccessibilityWindowDiscovery {
             isMinimized: boolAttribute(window, kAXMinimizedAttribute as CFString) ?? false,
             isNormalWindow: isNormalWindow,
             frontToBackIndex: index,
+            isFullscreen: boolAttribute(window, "AXFullScreen" as CFString)
+                ?? false,
             hasMediaIndicator: chrome.hasMediaIndicator,
             webViewProcessID: chrome.webViewProcessID
         )

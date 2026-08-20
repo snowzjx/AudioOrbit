@@ -1,6 +1,7 @@
 import AppKit
 import CoreAudio
 import Foundation
+import OSLog
 import UniformTypeIdentifiers
 import UserNotifications
 
@@ -94,46 +95,33 @@ final class AppModel: ObservableObject {
         var evidence: WindowDisplayEvidence?
         var decisionTask: Task<Void, Never>?
         var silentTickCount = 0
-        var anchorMissTickCount = 0
-        var anchorEventGateTickCount = 0
-        var mediaAnchorDwellTickCount = 0
-        var mediaAnchorMissTickCount = 0
-        var pendingMediaAnchorID: String?
         var anchoredWebViewProcessID: pid_t?
-        var anchoredPIDMissingTickCount = 0
+        var anchoredPIDLastReportedTick = 0
         var manualAnchorOverride = false
-        var forceImmediateDecision = false
+        var commitRetryAttempted = false
         var pendingSessionRelease = false
-        var suppressAnchorAdoptionThisTick = false
     }
 
     private static let hardwareChangeCoalescingDelay = Duration.milliseconds(100)
-    private static let overviewShrinkRatio: CGFloat = 0.6
-    private static let overviewGrowRatio: CGFloat = 1.4
-    private static let overviewMinimumWindows = 2
-    private static let overviewHoldMaximumTicks = 240
-    private static let axEventGateWindowTicks = 4
-    private static let axEventGateMaximumTicks = 240
-    /// Display-change dwell for eventless candidates. Drags and Space
-    /// transitions emit no AX events; the fallback scan is the only signal
-    /// either produces. A Space-swipe animation lasts roughly a second and
-    /// its animated frames must never outlive this dwell, while a real drag
-    /// lands well inside it.
-    private static let eventlessDisplayCommitDwell = Duration.seconds(3)
+    /// Recency window for event-corroborated decisions: an AX event
+    /// within this many ticks marks the evidence as backed by a real user
+    /// action (move, focus, create, destroy).
+    private static let eventRecentWindowTicks = 4
     private static let routeSilenceSuspendSeconds = 60
+    private static let routeSilenceMigrateSeconds = 3
+    private static let routeSilenceMigrateRetrySeconds = 5
     private static let reconnectDwell = Duration.seconds(1)
     private static let healthWarmUp = Duration.seconds(3)
-    private static let noEligibleWindowGrace = Duration.seconds(1)
     private static let cleanupRetryDelay = Duration.seconds(1)
     private static let playbackSessionSilenceTicks = 2
-    private static let anchorStalenessTicks = 16
-    private static let mediaAnchorDwellTicks = 6
-    private static let mediaAnchorMissToleranceTicks = 3
-    private static let freshMediaWindowAgeTicks = 12
-    private static let anchorFreshnessAdvantageTicks = 3
-    private static let anchorFollowNewWindowTicks = 6
-    private static let anchorFollowLongSilenceTicks = 48
-    private static let anchoredPIDMissingToleranceTicks = 6
+    /// Route-side debounce: the actual device switch fires only after the
+    /// target display has held steady for this long. Every event pushes its
+    /// candidate into the queue and restarts the timer, so rapid A-B-A-B
+    /// alternation is absorbed at the sink instead of being gated upstream.
+    private static let routeSwitchDebounce = Duration.milliseconds(500)
+    /// A renderer that stays unreported for this many ticks is genuinely
+    /// gone (the playing tab closed); shorter gaps are churn transients.
+    private static let anchorLongGapReleaseTicks = 24
     private static let followNotificationsDefaultsKey = "AudioOrbitFollowNotificationsEnabled"
 
     private let discovery = AudioDiscovery()
@@ -160,16 +148,13 @@ final class AppModel: ObservableObject {
     private var suppressedAutomaticSourcePIDs: Set<pid_t> = []
 
 
-    private var windowIdentifierAges: [pid_t: [String: Int]] = [:]
-    private var windowFrameAreaHistory: [String: CGFloat] = [:]
-    private var overviewHoldActive = false
-    private var overviewHoldRemainingTicks = 0
-    private var tickFrameAreas: [String: CGFloat] = [:]
     private var evidenceTickCounter = 0
-    private var lastAXEventTickByPID: [pid_t: Int] = [:]
-    private var lastDestroyedEventTickByPID: [pid_t: Int] = [:]
+
+
+
     private var lastSeenPlayingPIDs: Set<pid_t> = []
     private var windowFirstSeenTick: [String: Int] = [:]
+    private var lastMovedEventTickByPID: [pid_t: Int] = [:]
     /// Precomputed window→display evidence for applications that exist
     /// but are not currently playing. Recording the mapping while the
     /// process exists (the app's core principle) lets a playback start
@@ -177,10 +162,12 @@ final class AppModel: ObservableObject {
     /// fresh Accessibility round trip.
     private var precomputedEvidenceByOwnerPID: [pid_t: (evidence: WindowDisplayEvidence, at: ContinuousClock.Instant)] = [:]
     private var precomputeTickCounter = 0
-    private var previousTickFrameAreas: [String: CGFloat] = [:]
     private var reportedUnassociatedSourcePIDs: Set<pid_t> = []
     private var reportedSessionEvidenceIssuePIDs: Set<pid_t> = []
     private var applicationActivationObserver: NSObjectProtocol?
+    private var spaceChangeObserver: NSObjectProtocol?
+    private var lastKeepLogByPID: [pid_t: String] = [:]
+    private var lastWindowDumpDate: Date?
     private var hasPerformedTerminationCleanup = false
 
     var menuBarSymbol: String {
@@ -278,6 +265,14 @@ final class AppModel: ObservableObject {
             )
         }
         diagnostics.record("launch", category: "application")
+        let launchLogger = Logger(
+            subsystem: Bundle.main.bundleIdentifier
+                ?? "me.snowzjx.AudioOrbit",
+            category: "Anchor"
+        )
+        launchLogger.info(
+            "launch trusted=\(AXIsProcessTrusted(), privacy: .public)"
+        )
         guard startsServices else { return }
         deviceMonitor.onChange = { [weak self] in
             self?.scheduleHardwareReconciliation()
@@ -291,11 +286,11 @@ final class AppModel: ObservableObject {
             // starts are discovered without waiting for the idle poll.
             self?.scheduleHardwareFollowUpChecks()
         }
-        windowEventMonitor.onEvent = { [weak self] ownerPID, destroyedSeen in
+        windowEventMonitor.onEvent = { [weak self] ownerPID, movedSeen in
             Task { @MainActor [weak self] in
                 self?.noteAXEvent(
                     ownerPID: ownerPID,
-                    windowDestroyed: destroyedSeen
+                    windowMoved: movedSeen
                 )
                 await self?.refreshAutomaticWindowEvidence()
             }
@@ -322,6 +317,26 @@ final class AppModel: ObservableObject {
             Task { @MainActor [weak self] in
                 self?.precomputeTickCounter = 3
                 await self?.recheckAccessibilityAccess()
+            }
+        }
+        // Space changes are a trigger, not a judgment: entering or
+        // exiting a fullscreen Space fires no window events, so re-enumerate
+        // the windows and refresh the evidence. The decision path's
+        // debounce absorbs the transition animation itself.
+        spaceChangeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.activeSpaceDidChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.windowEventMonitor.resyncAllWindows()
+                let now = Date()
+                if now.timeIntervalSince(self.lastWindowDumpDate ?? .distantPast) >= 5 {
+                    self.lastWindowDumpDate = now
+                    self.windowEventMonitor.dumpWindowState()
+                }
+                await self.refreshAutomaticWindowEvidence()
             }
         }
         Task { await refresh() }
@@ -402,10 +417,6 @@ final class AppModel: ObservableObject {
         // media-indicator rule would immediately pull the anchor back to
         // the media window and the audio would snap back.
         state.committedWindowIdentifier = focusedID
-        state.anchorMissTickCount = 0
-        state.mediaAnchorDwellTickCount = 0
-        state.mediaAnchorMissTickCount = 0
-        state.pendingMediaAnchorID = nil
         state.manualAnchorOverride = true
         state.anchoredWebViewProcessID = state.evidence?
             .webViewProcessIDsByWindow[focusedID]
@@ -584,7 +595,6 @@ final class AppModel: ObservableObject {
             await stopRoute(matchingRouteID, preserveAutomaticMode: true)
         }
         persistConfiguration()
-        evaluateOverviewHold()
         await precomputeWindowMappings()
         updateAutomaticRoutingSummary()
         publishRoutes()
@@ -701,9 +711,12 @@ final class AppModel: ObservableObject {
             return
         }
         ensureWindowObservation()
-        if automaticRoutingEnabled {
-            await refreshAutomaticWindowEvidence()
-        }
+        // The window-selection check is event-driven: AX events, Space
+        // changes, display reconfigurations, and hardware reconciliations
+        // trigger refreshAutomaticWindowEvidence. The poll keeps the
+        // display snapshot, the accessibility check, and the observer
+        // registrations fresh but does not re-judge the selection on its
+        // own cadence.
     }
 
     func startProbe() async {
@@ -775,6 +788,17 @@ final class AppModel: ObservableObject {
         guard let session = sessions[routeID] else { return }
         diagnostics.markRouteTransition()
         diagnostics.record("stop-requested", category: "route")
+        let stopLogger = Logger(
+            subsystem: Bundle.main.bundleIdentifier
+                ?? "me.snowzjx.AudioOrbit",
+            category: "Anchor"
+        )
+        let frames = Thread.callStackSymbols
+        let caller = frames.dropFirst(3).prefix(5)
+            .joined(separator: " | ")
+        stopLogger.info(
+            "stop caller=\(caller, privacy: .public) source=\(session.sourcePID, privacy: .public)"
+        )
         session.cleanupCompletion = completion
         session.cleanupRetryTask?.cancel()
         session.cleanupRetryTask = nil
@@ -1004,6 +1028,12 @@ final class AppModel: ObservableObject {
             NotificationCenter.default.removeObserver(applicationActivationObserver)
             self.applicationActivationObserver = nil
         }
+        if let spaceChangeObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(
+                spaceChangeObserver
+            )
+            self.spaceChangeObserver = nil
+        }
     }
 
     private var activeSourcePIDs: Set<pid_t> {
@@ -1046,12 +1076,20 @@ final class AppModel: ObservableObject {
     private func scheduleHardwareFollowUpChecks() {
         hardwareFollowUpTask?.cancel()
         hardwareFollowUpTask = Task { [weak self] in
-            try? await Task.sleep(for: .milliseconds(1500))
-            guard !Task.isCancelled, let self else { return }
-            await self.reconcileAudioHardware(clearErrorOnSuccess: false)
-            try? await Task.sleep(for: .milliseconds(1500))
-            guard !Task.isCancelled else { return }
-            await self.reconcileAudioHardware(clearErrorOnSuccess: false)
+            // The process-table event fires when the audio connection is
+            // established, before output actually starts (launch-then-play).
+            // Reconcile quickly in a short series so playback starts are
+            // discovered within about a second instead of waiting for the
+            // idle poll.
+            for followUpDelay in [300, 600, 900, 1500, 2500, 4000] {
+                try? await Task.sleep(
+                    for: .milliseconds(followUpDelay)
+                )
+                guard !Task.isCancelled, let self else { return }
+                await self.reconcileAudioHardware(
+                    clearErrorOnSuccess: false
+                )
+            }
         }
     }
 
@@ -1117,11 +1155,13 @@ final class AppModel: ObservableObject {
             updateWatchedDeviceIDs()
             publishRoutes()
             if automaticRoutingEnabled {
+                // The per-decision delay logic already distinguishes
+                // event-backed commits, eventless dwells, and route-less
+                // immediate starts; a blanket reconnect dwell here only
+                // delayed the first route by a second after playback
+                // detection.
                 await refreshAutomaticWindowEvidence(
-                    forceImmediate: didDisconnectHeadphoneOverride,
-                    requestedDelay: didDisconnectHeadphoneOverride
-                        ? .zero
-                        : Self.reconnectDwell
+                    forceImmediate: didDisconnectHeadphoneOverride
                 )
             }
         } catch {
@@ -1264,11 +1304,9 @@ final class AppModel: ObservableObject {
     }
 
     private func refreshAutomaticWindowEvidence(
-        forceImmediate: Bool = false,
-        requestedDelay: Duration? = nil
+        forceImmediate: Bool = false
     ) async {
         guard automaticRoutingEnabled else { return }
-        tickFrameAreas.removeAll(keepingCapacity: true)
         evidenceTickCounter += 1
         let currentlyPlayingPIDs = Set(processes.filter(\.isRunningOutput).map(\.pid))
         if !currentlyPlayingPIDs.isSubset(of: lastSeenPlayingPIDs) {
@@ -1302,21 +1340,22 @@ final class AppModel: ObservableObject {
             automaticTracking[pid]?.decisionTask?.cancel()
             let trackedState = automaticTracking.removeValue(forKey: pid)
             guard automaticRouteIDs[pid] != nil else { continue }
-            // Safari restarts its media helper (WebKit.GPU) during
-            // fullscreen transitions. When a replacement source exists for
-            // the same owner, migrate the route to it instead of stopping,
-            // so the audio never falls back mid-transition.
+            // Safari restarts its media helper during fullscreen
+            // transitions: the old process dies moments before the
+            // replacement appears, so stopping immediately produced an
+            // audible stop/start loop. Migrate at once when a replacement
+            // already exists; otherwise keep the route and retry for a
+            // few seconds before giving up.
             if let replacement = replacementSource(forVanishedPID: pid),
                let trackedState {
-                // Mark the migrated state as still running so the
-                // session-boundary detection below does not treat the
-                // replacement as a brand-new playback session and
-                // release the anchor mid-transition.
                 trackedState.wasRunningOutput = true
                 automaticTracking[replacement.pid] = trackedState
                 await migrateAutomaticRoute(fromPID: pid, to: replacement)
             } else {
-                await stopAutomaticRoute(for: pid)
+                scheduleVanishedSourceGrace(
+                    for: pid,
+                    state: trackedState
+                )
             }
         }
 
@@ -1332,7 +1371,12 @@ final class AppModel: ObservableObject {
                     isRunningOutput: true,
                     silenceTicks: state.silentTickCount,
                     requiredSilenceTicks: Self.playbackSessionSilenceTicks
-                ) {
+                ),
+                    // A brand-new source has no session to release; the
+                    // ceremony would only delay its first route by several
+                    // ticks (launch-then-play sources sit through it twice).
+                    state.committedDisplayUUID != nil
+                        || state.committedWindowIdentifier != nil {
                     // Defer the anchor release until this tick's evidence
                     // is available: a pause/resume of the same tab keeps
                     // its renderer in the anchor window and must NOT count
@@ -1361,7 +1405,8 @@ final class AppModel: ObservableObject {
             AudioProcessSnapshot,
             ProcessWindowAssociation?,
             UUID?,
-            String?
+            String?,
+            Bool
         )] = sources.map { source in
                 let association = processWindowResolver.resolve(source)
                 if association == nil,
@@ -1375,6 +1420,10 @@ final class AppModel: ObservableObject {
                     )
                 }
                 let committedDisplayUUID = automaticTracking[source.pid]?.committedDisplayUUID
+                // The display follows the window the video plays in: the
+                // renderer-PID-tracked anchor window. Dragging that window
+                // moves its frame and the route follows; the fullscreen
+                // presentation still wins over it during fullscreen.
                 let preferredWindowIdentifier: String?
                 if let state = automaticTracking[source.pid],
                    let association,
@@ -1385,11 +1434,15 @@ final class AppModel: ObservableObject {
                 } else {
                     preferredWindowIdentifier = nil
                 }
+                let suppressFullscreenPreference = association.map {
+                    movedRecently(ownerPID: $0.windowOwner.pid)
+                } ?? false
                 return (
                     source,
                     association,
                     committedDisplayUUID,
-                    preferredWindowIdentifier
+                    preferredWindowIdentifier,
+                    suppressFullscreenPreference
                 )
             }
         await withTaskGroup(
@@ -1399,7 +1452,7 @@ final class AppModel: ObservableObject {
                 WindowDisplayEvidence?
             ).self
         ) { group in
-            for (source, association, committedDisplayUUID, preferredWindowIdentifier)
+            for (source, association, committedDisplayUUID, preferredWindowIdentifier, suppressFullscreenPreference)
                 in evidenceRequests {
                 let cachedEvidence: WindowDisplayEvidence?
                 if let association {
@@ -1424,7 +1477,8 @@ final class AppModel: ObservableObject {
                         associationReason: association.reason,
                         displays: currentDisplays,
                         committedDisplayUUID: committedDisplayUUID,
-                        preferredWindowIdentifier: preferredWindowIdentifier
+                        preferredWindowIdentifier: preferredWindowIdentifier,
+                        suppressFullscreenPreference: suppressFullscreenPreference
                     )
                     return (source, association, evidence)
                 }
@@ -1436,6 +1490,14 @@ final class AppModel: ObservableObject {
                        || automaticTracking[source.pid]?.wasRunningOutput == true,
                    !reportedSessionEvidenceIssuePIDs.contains(source.pid) {
                     reportedSessionEvidenceIssuePIDs.insert(source.pid)
+                    let issueLogger = Logger(
+                        subsystem: Bundle.main.bundleIdentifier
+                            ?? "me.snowzjx.AudioOrbit",
+                        category: "Anchor"
+                    )
+                    issueLogger.warning(
+                        "evidence issue pid=\(source.pid, privacy: .public): \(evidence?.issue ?? "unknown", privacy: .public)"
+                    )
                     diagnostics.record(
                         "session-evidence-issue",
                         category: "routing",
@@ -1446,8 +1508,7 @@ final class AppModel: ObservableObject {
                     for: source,
                     association: association,
                     evidence: evidence,
-                    force: forceImmediate,
-                    requestedDelay: requestedDelay
+                    force: forceImmediate
                 )
             }
         }
@@ -1571,17 +1632,12 @@ final class AppModel: ObservableObject {
         for source: AudioProcessSnapshot,
         association: ProcessWindowAssociation?,
         evidence: WindowDisplayEvidence?,
-        force: Bool,
-        requestedDelay: Duration?
+        force: Bool
     ) {
         guard automaticRoutingEnabled else { return }
         let state = automaticTracking[source.pid] ?? AutomaticTrackingState()
         automaticTracking[source.pid] = state
         var effectiveForce = force
-        if state.forceImmediateDecision {
-            effectiveForce = true
-            state.forceImmediateDecision = false
-        }
         // The very first route for a directly associated process takes over
         // immediately: focus-based selection is trustworthy for regular
         // applications, and skipping the display dwell removes a visible
@@ -1596,37 +1652,11 @@ final class AppModel: ObservableObject {
         state.wasRunningOutput = source.isRunningOutput
         state.association = association
         state.evidence = evidence
-        if let evidence {
-            accumulateOverviewFrames(evidence: evidence)
-        }
-        var eventGated = false
-        var eventBacked = false
-        var destroyedRecently = false
         if let association,
            let evidence {
-            // The playback window is identified by the strongest available
-            // signal, in order: (1) the anchored tab's renderer pid — Safari
-            // exposes each window's active-tab WebViewProcessID, and a tab
-            // that keeps its renderer through a tear-off is tracked exactly;
-            // (2) the unique media-indicator window; (3) the freshest media
-            // window — a torn-off tab lands in a freshly created window, so
-            // when the source window keeps a stale indicator and several
-            // windows report media, the newest one is the destination.
-            let ownerPID = association.windowOwner.pid
-            let mediaIdentifiers = Set(evidence.mediaPlayingWindowIdentifiers)
-            // A recent AX event corroborates the evidence as a real user
-            // action (window moved/closed), so the display dwell below can
-            // be skipped: the event is the "arrived" signal the dwell was
-            // waiting for. Mission Control emits none and keeps the dwell.
-            eventBacked = evidenceTickCounter
-                - (lastAXEventTickByPID[ownerPID] ?? 0)
-                <= Self.axEventGateWindowTicks
-            destroyedRecently = destroyedEventRecent(ownerPID: ownerPID)
-            eventGated = eventGateHolding(
-                state: state,
-                evidence: evidence,
-                ownerPID: ownerPID
-            )
+            // The anchor is the pair (renderer PID, current reporter
+            // window). Both are managed by the sticky-PID adoption below;
+            // nothing else in the decision path may write them.
             let pidMap = evidence.webViewProcessIDsByWindow
             for identifier in pidMap.keys
                 where windowFirstSeenTick[identifier] == nil {
@@ -1634,58 +1664,32 @@ final class AppModel: ObservableObject {
             }
             if state.pendingSessionRelease {
                 state.pendingSessionRelease = false
-                let sameTabResumed: Bool
-                if let anchorID = state.committedWindowIdentifier,
-                   let anchoredPID = state.anchoredWebViewProcessID,
-                   pidMap[anchorID] == anchoredPID {
-                    sameTabResumed = true
-                } else {
-                    sameTabResumed = false
-                }
-                if sameTabResumed {
-                    diagnostics.record(
-                        "playback-resume-kept-anchor",
-                        category: "routing"
-                    )
-                } else {
-                    state.committedWindowIdentifier = nil
-                    state.anchorMissTickCount = 0
-                    state.mediaAnchorDwellTickCount = 0
-                    state.mediaAnchorMissTickCount = 0
-                    state.pendingMediaAnchorID = nil
+                // The playing identity is the RENDERER PID, not the window:
+                // a stop→start transition (helper restart, fullscreen churn)
+                // does not release it. A single-tick check is too fragile —
+                // the churn's transient report gaps would false-release. The
+                // long-gap release below handles genuinely closed tabs.
+                diagnostics.record(
+                    "playback-session-kept",
+                    category: "routing"
+                )
+            }
+            // Long-gap release: only a renderer that stays unreported for
+            // many ticks is genuinely gone. The churn's 1-2 s report gaps
+            // never reach this threshold.
+            if let anchoredPID = state.anchoredWebViewProcessID {
+                if pidMap.values.contains(anchoredPID) {
+                    state.anchoredPIDLastReportedTick = evidenceTickCounter
+                } else if evidenceTickCounter
+                    - state.anchoredPIDLastReportedTick
+                    >= Self.anchorLongGapReleaseTicks {
                     state.anchoredWebViewProcessID = nil
-                    state.anchoredPIDMissingTickCount = 0
+                    state.committedWindowIdentifier = nil
                     state.manualAnchorOverride = false
-                    state.forceImmediateDecision = false
-                    state.suppressAnchorAdoptionThisTick = true
                     diagnostics.record(
-                        "playback-session-detected",
+                        "playback-anchor-released",
                         category: "routing"
                     )
-                }
-            }
-            let currentIDs = Set(evidence.candidateWindowIdentifiers)
-            var ages = windowIdentifierAges[ownerPID] ?? [:]
-            for identifier in currentIDs {
-                ages[identifier, default: 0] += 1
-            }
-            windowIdentifierAges[ownerPID] = ages
-            // Adopt the anchor window's renderer only when doing so cannot
-            // destroy a still-live playback signal. While a playing tab
-            // moves between windows, Safari may activate another tab in the
-            // anchor window, so its BrowserView pid no longer belongs to the
-            // media. Keep the saved pid while it is still reported anywhere
-            // (the moved tab keeps its renderer), and only re-adopt once the
-            // old renderer is gone and the anchor window shows media again.
-            if source.isRunningOutput,
-               let anchor = state.committedWindowIdentifier,
-               let anchorPID = pidMap[anchor] {
-                let savedPID = state.anchoredWebViewProcessID
-                let savedStillReported = savedPID.map { pidMap.values.contains($0) }
-                    ?? false
-                let anchorPlaysMedia = mediaIdentifiers.contains(anchor)
-                if savedPID == nil || (!savedStillReported && anchorPlaysMedia) {
-                    state.anchoredWebViewProcessID = anchorPID
                 }
             }
             let targetID: String?
@@ -1694,229 +1698,119 @@ final class AppModel: ObservableObject {
                 // following stays suppressed until the playback session
                 // restarts or the pinned window disappears.
                 targetID = nil
-            } else if source.isRunningOutput,
-               let anchoredPID = state.anchoredWebViewProcessID {
-                // The renderer pid is the authoritative signal. Safari's
-                // audio indicator follows the focused window, not the
-                // playing one, so the media heuristic must never override
-                // a renderer that is still reported in the anchor window.
-                let windowsWithPID = pidMap.filter { $0.value == anchoredPID }
-                    .map(\.key)
+            } else if WindowRouteAffinityPolicy.pinsInitialWindow(
+                for: association.reason
+            ), source.isRunningOutput {
+                // The anchor is the pair (renderer PID, current reporter).
+                // The PID is STICKY: it is seeded once and released only by
+                // the long-gap rule. The window re-pins every tick to
+                // whichever window reports the PID — tear-offs follow, and
+                // the churn's transient windows merely flip the display
+                // candidate, which the route-side debounce absorbs.
                 let anchorID = state.committedWindowIdentifier
-                if windowsWithPID.count == 1,
-                   windowsWithPID[0] != anchorID {
-                    // The renderer is reported by exactly one other window.
-                    if anchorID == nil {
-                        // First adoption: there is no anchor to hold.
-                        state.anchoredPIDMissingTickCount = 0
-                        targetID = windowsWithPID[0]
-                    } else {
-                        // During fullscreen and Mission Control, Safari
-                        // alternates which window reports. Follow only
-                        // when the change is corroborated (new window,
-                        // recent owner AX event, or very long silence).
-                        state.anchoredPIDMissingTickCount += 1
-                        let destinationID = windowsWithPID[0]
-                        let allowed = anchorFollowAllowed(
-                            destinationID: destinationID,
-                            missingTickCount: state.anchoredPIDMissingTickCount
-                        )
-                        if allowed,
-                           state.anchoredPIDMissingTickCount
-                               >= Self.anchoredPIDMissingToleranceTicks,
-                           !eventGated {
-                            targetID = destinationID
-                        } else {
-                            targetID = nil
-                        }
-                    }
-                } else if let anchorID,
-                          windowsWithPID.count == 2,
-                          let other = windowsWithPID.first(where: { $0 != anchorID }) {
-                    // Both the anchor window and another window report the
-                    // renderer. After a tab tear-off the anchor's BrowserView
-                    // entry stays stale until its active tab navigates. A
-                    // freshly created reporting window is the torn-off
-                    // destination, so let freshness arbitrate instead of
-                    // waiting for the user to navigate the anchor window.
-                    let otherAge = ages[other] ?? 0
-                    let anchorAge = ages[anchorID] ?? 0
-                    state.anchoredPIDMissingTickCount = 0
-                    // Require a freshness ADVANTAGE, not just a one-tick
-                    // lead: with both windows reporting, equal ages must
-                    // not flip the anchor back and forth every dwell.
-                    if otherAge <= Self.freshMediaWindowAgeTicks,
-                       otherAge + Self.anchorFreshnessAdvantageTicks < anchorAge,
-                       anchorFollowAllowed(
-                           destinationID: other,
-                           missingTickCount: state.anchoredPIDMissingTickCount
-                       ) {
-                        targetID = other
+                if let anchoredPID = state.anchoredWebViewProcessID,
+                   let reporter = pidMap.first(where: {
+                       $0.value == anchoredPID
+                   })?.key {
+                    targetID = reporter != anchorID ? reporter : nil
+                } else if anchorID == nil {
+                    // First adoption: seed from the selected window's
+                    // renderer (the window the user sees at playback
+                    // start). A window without a renderer cannot anchor;
+                    // the next tick retries.
+                    if let selectedID = evidence.selectedWindowIdentifier,
+                       pidMap[selectedID] != nil {
+                        targetID = selectedID
                     } else {
                         targetID = nil
                     }
-                } else if anchorID.map({ windowsWithPID.contains($0) }) ?? false {
-                    // The playing tab is still in the anchor window.
-                    state.anchoredPIDMissingTickCount = 0
-                    targetID = nil
                 } else {
-                    // The renderer is not reported anywhere this tick.
-                    // Tolerate transient Accessibility gaps before falling
-                    // back, so a short hiccup cannot yank the audio. A
-                    // fullscreen transition removes the standard AX window
-                    // entirely; while the anchor window is invisible and no
-                    // replacement window has appeared, keep holding instead
-                    // of letting the focus-driven indicator take over.
-                    state.anchoredPIDMissingTickCount += 1
-                    let anchorInvisible = anchorIsTemporarilyInvisible(
-                        state: state,
-                        evidence: evidence
-                    ) || overviewHoldActive || eventGated
-                    if (state.anchoredPIDMissingTickCount
-                        >= Self.anchoredPIDMissingToleranceTicks
-                        || destroyedRecently),
-                       !anchorInvisible {
-                        targetID = WindowRouteAffinityPolicy.bestMediaTarget(
-                            mediaIdentifiers,
-                            ages: ages,
-                            freshWindowAgeTicks: Self.freshMediaWindowAgeTicks
-                        )
-                    } else {
-                        targetID = nil
-                    }
+                    targetID = nil
                 }
             } else {
-                targetID = WindowRouteAffinityPolicy.bestMediaTarget(
-                    mediaIdentifiers,
-                    ages: ages,
-                    freshWindowAgeTicks: Self.freshMediaWindowAgeTicks
-                )
+                targetID = nil
             }
             if source.isRunningOutput,
                let targetID,
                targetID != state.committedWindowIdentifier {
-                // The same window must hold the target for the whole
-                // dwell. Requiring continuity prevents the anchor from
-                // flip-flopping when two windows alternate.
-                if state.pendingMediaAnchorID == targetID {
-                    state.mediaAnchorDwellTickCount += 1
-                } else {
-                    state.pendingMediaAnchorID = targetID
-                    state.mediaAnchorDwellTickCount = 1
-                }
-                state.mediaAnchorMissTickCount = 0
-                // The same window must hold the target for the whole
-                // dwell. During tab transitions Safari can transiently
-                // report the renderer in either window, and a shorter
-                // dwell made the anchor follow every flicker.
-                if state.mediaAnchorDwellTickCount >= Self.mediaAnchorDwellTicks {
-                    state.mediaAnchorDwellTickCount = 0
-                    state.mediaAnchorMissTickCount = 0
-                    state.pendingMediaAnchorID = nil
-                    state.committedWindowIdentifier = targetID
-                    state.anchorMissTickCount = 0
+                // Adoption updates the anchor only: the display commit
+                // flows through the route-side debounce queue like every
+                // other change, so churn-time adoptions cannot bypass it.
+                state.committedWindowIdentifier = targetID
+                if state.anchoredWebViewProcessID == nil {
+                    // The PID is sticky — never replaced by the window's
+                    // own renderer once seeded.
                     state.anchoredWebViewProcessID = pidMap[targetID]
-                        ?? state.anchoredWebViewProcessID
-                    state.forceImmediateDecision = true
-                    diagnostics.record(
-                        "playback-anchor-followed-media-window",
-                        category: "routing"
-                    )
                 }
-            } else if source.isRunningOutput,
-                      let pendingID = state.pendingMediaAnchorID,
-                      mediaIdentifiers.isEmpty
-                          || mediaIdentifiers.contains(pendingID) {
-                // The pending window's indicator is momentarily missing
-                // or shadowed by another window's indicator. Tolerate a
-                // few ticks so a busy Safari cannot starve the dwell.
-                state.mediaAnchorMissTickCount += 1
-                if state.mediaAnchorMissTickCount
-                    >= Self.mediaAnchorMissToleranceTicks {
-                    state.mediaAnchorDwellTickCount = 0
-                    state.mediaAnchorMissTickCount = 0
-                    state.pendingMediaAnchorID = nil
-                }
-            } else {
-                state.mediaAnchorDwellTickCount = 0
-                state.mediaAnchorMissTickCount = 0
-                state.pendingMediaAnchorID = nil
-            }
-        }
-        if let association {
-            // A window anchor that no longer matches any eligible window (for
-            // example the anchored Safari window was closed) silently degrades
-            // routing to follow-focus behavior, because every selection falls
-            // back past the preferred identifier. After a short staleness
-            // dwell, re-pin the anchor to the window that is actually being
-            // followed so later focus changes stop moving established audio.
-            if state.committedWindowIdentifier != nil,
-               evidence?.selectedWindowIdentifier != nil,
-               evidence?.selectionSource != .routeAnchor,
-               evidence?.selectedWindowIsSurfaceOnly != true,
-               !(anchorIsTemporarilyInvisible(
-                   state: state,
-                   evidence: evidence
-               ) || overviewHoldActive || eventGated) {
-                state.anchorMissTickCount += 1
-                // A destroyed-event corroboration means the anchored window
-                // really closed: re-pin immediately instead of waiting out
-                // the staleness dwell.
-                if state.anchorMissTickCount >= Self.anchorStalenessTicks
-                    || destroyedRecently {
-                    state.anchorMissTickCount = 0
-                    state.committedWindowIdentifier = nil
-                    state.manualAnchorOverride = false
-                    diagnostics.record(
-                        "playback-anchor-repinned",
-                        category: "routing"
-                    )
-                }
-            } else {
-                state.anchorMissTickCount = 0
-            }
-            if state.suppressAnchorAdoptionThisTick {
-                // A deferred session release must not adopt this tick's
-                // selection, which was computed against the stale anchor;
-                // the next tick re-selects from scratch.
-                state.suppressAnchorAdoptionThisTick = false
-            } else {
-                // A pure surface (Safari's fullscreen video surface) may
-                // drive the display but must never become the anchor; the
-                // anchor belongs to the application's real window.
-                let anchorSelection = evidence?.selectedWindowIsSurfaceOnly == true
-                    ? nil
-                    : evidence?.selectedWindowIdentifier
-                state.committedWindowIdentifier = WindowRouteAffinityPolicy.routeAnchor(
-                    existing: state.committedWindowIdentifier,
-                    selected: anchorSelection,
-                    associationReason: association.reason
+                let followedAge = windowFirstSeenTick[targetID]
+                    .map { evidenceTickCounter - $0 }
+                let fromRenderer = pidMap[targetID] != nil
+                let anchorLogger = Logger(
+                    subsystem: Bundle.main.bundleIdentifier
+                        ?? "me.snowzjx.AudioOrbit",
+                    category: "Anchor"
+                )
+                anchorLogger.info(
+                    "follow target=\(targetID, privacy: .public) age=\(followedAge.map(String.init) ?? "never", privacy: .public) fromRenderer=\(fromRenderer ? "yes" : "no", privacy: .public)"
+                )
+                diagnostics.record(
+                    "playback-anchor-followed-media-window",
+                    category: "routing"
                 )
             }
         }
-        let candidateDisplayUUID = evidence?.displayUUID
-
-        // Native and HTML video fullscreen transitions can temporarily remove
-        // the standard AX window even though the audio process keeps playing.
-        // Retain an established route on its last connected display instead of
-        // audibly falling back to the system default or another focused
-        // window. This also covers the case where the evidence selects a
-        // fallback window while the anchor is merely invisible — fullscreen
-        // must never move the audio. A newly playing process still requires
-        // positive window evidence before its first route.
-        let anchorTemporarilyInvisible = anchorIsTemporarilyInvisible(
-            state: state,
-            evidence: evidence
-        ) || overviewHoldActive || eventGated
-        if candidateDisplayUUID == nil || anchorTemporarilyInvisible,
-           let committedDisplayUUID = state.committedDisplayUUID,
-           displays.contains(where: { $0.id == committedDisplayUUID }),
+        // The fullscreen surface drives the display by design. It does not
+        // have to win window selection: while the anchor is gone (its window
+        // was destroyed by Safari's fullscreen churn) any surface candidate
+        // takes over the display, resolving from its own frame — Safari keeps
+        // the hidden desktop window focused, so focus-based selection alone
+        // would keep the route pinned to the pre-fullscreen display.
+        let surfaceIdentifiers = Set(evidence?.surfaceOnlyWindowIdentifiers ?? [])
+        let anchorGone = state.committedWindowIdentifier.map { anchorID in
+            !(evidence?.candidateWindowIdentifiers.contains(anchorID) ?? false)
+        } ?? true
+        var candidateDisplayUUID = evidence?.displayUUID
+        let surfaceTakeover = anchorGone
+            && !surfaceIdentifiers.isEmpty
+        if surfaceTakeover,
+           let surfaceDisplay = surfaceDisplayUUID(
+               for: surfaceIdentifiers,
+               evidence: evidence
+           ) {
+            candidateDisplayUUID = surfaceDisplay
+        }
+        if candidateDisplayUUID == nil,
            let routeID = automaticRouteIDs[source.pid],
-           let session = sessions[routeID],
-           session.state == .running {
+           let session = sessions[routeID] {
+            // No candidate evidence: keep the established route in EVERY
+            // session state (switching, reconnecting, running alike). A
+            // route ends only when its source process ends. Re-sync the
+            // tracking display in case the route was started by the
+            // takeover path, which commits without scheduling a decision.
+            if state.committedDisplayUUID == nil,
+               let followed = session.followedDisplayUUID,
+               displays.contains(where: { $0.id == followed }) {
+                state.committedDisplayUUID = followed
+            }
             state.hasCandidate = false
             state.decisionTask?.cancel()
             state.decisionTask = nil
+            let issueText = evidence?.issue ?? "none"
+            let committedText = state.committedDisplayUUID.map {
+                String($0.uuidString.prefix(8))
+            } ?? "nil"
+            let keepSignature = "issue=\(issueText) committed=\(committedText)"
+            if lastKeepLogByPID[source.pid] != keepSignature {
+                lastKeepLogByPID[source.pid] = keepSignature
+                let keepLogger = Logger(
+                    subsystem: Bundle.main.bundleIdentifier
+                        ?? "me.snowzjx.AudioOrbit",
+                    category: "Anchor"
+                )
+                keepLogger.warning(
+                    "keep pid=\(source.pid, privacy: .public) \(keepSignature)"
+                )
+            }
             let notice = "The window is transitioning or fullscreen. Keeping the last output."
             if session.notice != notice {
                 session.notice = notice
@@ -1944,16 +1838,15 @@ final class AppModel: ObservableObject {
         state.hasCandidate = true
         state.candidateDisplayUUID = candidateDisplayUUID
         state.decisionTask?.cancel()
-        let committedDisplayDisconnected = state.committedDisplayUUID.map { committed in
-            !displays.contains { $0.id == committed }
-        } ?? false
-        let delay = requestedDelay
-            ?? (effectiveForce || committedDisplayDisconnected
-                || eventBacked || destroyedRecently
-                ? .zero
-                : (candidateDisplayUUID == nil
-                    ? Self.noEligibleWindowGrace
-                    : Self.eventlessDisplayCommitDwell))
+        // Route-side debounce queue: every candidate restarts the timer,
+        // and the actual switch fires only once the target display has
+        // held steady for the debounce interval. Rapid A-B-A-B
+        // alternation is absorbed here, at the sink, instead of being
+        // gated upstream — upstream lets every event through.
+        let delay = (effectiveForce
+            || automaticRouteIDs[source.pid] == nil)
+            ? Duration.zero
+            : Self.routeSwitchDebounce
         state.decisionTask = Task { [weak self] in
             try? await Task.sleep(for: delay)
             guard !Task.isCancelled, let self else { return }
@@ -1974,9 +1867,11 @@ final class AppModel: ObservableObject {
               state.candidateDisplayUUID == candidateDisplayUUID else { return }
         guard let displayUUID = candidateDisplayUUID,
               let display = displays.first(where: { $0.id == displayUUID }) else {
-            state.committedDisplayUUID = nil
-            await stopAutomaticRoute(for: sourcePID)
-            updateAutomaticRoutingSummary()
+            // The decision path NEVER stops a route. Transitional evidence
+            // gaps (fullscreen churn, Mission Control) must leave
+            // established routes alone; vanished sources are handled
+            // exclusively by the vanish-grace machinery.
+            state.hasCandidate = false
             return
         }
         state.committedDisplayUUID = displayUUID
@@ -1993,21 +1888,32 @@ final class AppModel: ObservableObject {
                   $0.uid == target.destinationDeviceUID && $0.isAlive
               }),
               let association = state.association else {
-            if let mapping = mappings.first(where: { $0.displayUUID == displayUUID }),
-               mapping.behavior == .routeToDevice,
-               mapping.resolvedDevice(in: devices) == nil {
-                state.hasCandidate = false
+            // Target resolution can fail transiently (the media helper is
+            // mid-swap, the association is briefly nil, the destination is
+            // reconnecting). The decision path never stops a route, and it
+            // must not drop the commit either: after a drag ends no more
+            // moved events arrive, so a dropped candidate would leave the
+            // drag permanently unfollowed. Retry once shortly.
+            if !state.commitRetryAttempted {
+                state.commitRetryAttempted = true
+                state.decisionTask?.cancel()
+                state.decisionTask = Task { [weak self] in
+                    try? await Task.sleep(for: .milliseconds(500))
+                    guard !Task.isCancelled, let self else { return }
+                    guard let retryState = self.automaticTracking[sourcePID],
+                          retryState.hasCandidate,
+                          retryState.candidateDisplayUUID == displayUUID else {
+                        return
+                    }
+                    await self.commitAutomaticRoute(
+                        sourcePID: sourcePID,
+                        candidateDisplayUUID: displayUUID
+                    )
+                }
             }
-            await stopAutomaticRoute(for: sourcePID)
-            updateAutomaticRoutingSummary()
             return
         }
-        state.committedWindowIdentifier = WindowRouteAffinityPolicy.routeAnchor(
-            existing: state.committedWindowIdentifier,
-            selected: state.evidence?.selectedWindowIdentifier,
-            associationReason: association.reason
-        )
-
+        state.commitRetryAttempted = false
         if let routeID = automaticRouteIDs[sourcePID],
            let session = sessions[routeID] {
             switch RouteLifecyclePolicy.reconciliationAction(
@@ -2020,8 +1926,7 @@ final class AppModel: ObservableObject {
                     for: source,
                     association: association,
                     evidence: state.evidence,
-                    force: true,
-                    requestedDelay: .milliseconds(250)
+                    force: true
                 )
                 return
             case .replaceRoute:
@@ -2059,13 +1964,16 @@ final class AppModel: ObservableObject {
                 for: source,
                 association: association,
                 evidence: windowEvidenceForRetry(source: source, display: display),
-                force: true,
-                requestedDelay: .milliseconds(250)
+                force: true
             )
             return
         }
 
         diagnostics.record("takeover-committed", category: "route")
+        // The takeover commits this display: record it in the tracking
+        // state so a later nil-candidate tick (broken evidence during
+        // window churn) keeps the route instead of stopping it.
+        state.committedDisplayUUID = display.id
         await startAutomaticRoute(
             source: source,
             displayedSourceName: association.windowOwner.name,
@@ -2085,172 +1993,49 @@ final class AppModel: ObservableObject {
     /// otherwise fall back to another fresh window (for example Safari's
     /// desktop window behind a fullscreen video) and land on the wrong
     /// output when Mission Control closes. The hold releases when the
-    /// windows grow back to normal sizes.
-    /// Merges this tick's candidate window frames (across every source)
-    /// so the end-of-tick evaluation can compare the whole desktop's
-    /// geometry against the last stable baseline.
-    private func accumulateOverviewFrames(evidence: WindowDisplayEvidence) {
-        for (identifier, frame) in evidence.candidateWindowFrames {
-            let area = frame.width * frame.height
-            guard area > 0 else { continue }
-            tickFrameAreas[identifier] = area
-        }
-    }
-
-    /// Mission Control scales every visible window simultaneously; a real
-    /// user resize affects a single window. A mass shrink (or a shrink
-    /// combined with a missing anchor) engages a hold that keeps every
-    /// established route on its committed display, because the overview's
-    /// scaled geometry must never migrate a route — the anchor would
-    /// otherwise fall back to another fresh window (for example Safari's
-    /// desktop window behind a fullscreen video) and land on the wrong
-    /// output when Mission Control closes.
-    ///
-    /// The hold releases as soon as the anchor returns at normal scale,
-    /// or any window grows back, or a backstop timeout expires — it must
-    /// never outlive the overview or freeze tab following.
     /// Records that a window-level AX event arrived for an application.
     /// Mission Control never emits these, while genuine window moves and
     /// tab tear-offs do — so event recency is the discriminator between
     /// overview transforms and real user actions.
-    private func noteAXEvent(ownerPID: pid_t, windowDestroyed: Bool) {
+    private func noteAXEvent(ownerPID: pid_t, windowMoved: Bool) {
         precomputeTickCounter = 3
-        lastAXEventTickByPID[ownerPID] = evidenceTickCounter
-        if windowDestroyed {
-            lastDestroyedEventTickByPID[ownerPID] = evidenceTickCounter
+        if windowMoved {
+            lastMovedEventTickByPID[ownerPID] = evidenceTickCounter
         }
     }
 
-    /// True when the owner recently emitted a window-destroyed
-    /// notification. A destroyed window is gone for real, so tick-based
-    /// stale-anchor waiting and no-candidate grace can be skipped: the
-    /// event already answered what the ticks were guessing at.
-    private func destroyedEventRecent(ownerPID: pid_t) -> Bool {
-        lastDestroyedEventTickByPID[ownerPID].map {
-            evidenceTickCounter - $0 <= Self.axEventGateWindowTicks
+    /// True when the owner recently emitted a window-moved notification:
+    /// the user is actively dragging a window, so the dragged (focused)
+    /// window must steer the display even over a lingering fullscreen
+    /// presentation.
+    private func movedRecently(ownerPID: pid_t) -> Bool {
+        lastMovedEventTickByPID[ownerPID].map {
+            evidenceTickCounter - $0 <= Self.eventRecentWindowTicks
         } ?? false
     }
 
-    /// True while the anchor window is missing and no recent AX event
-    /// backs the change — the signature of Mission Control's overview,
-    /// whose scaled geometry must never move a route. Real moves fire
-    /// events and clear the gate immediately.
-    /// True when an anchor follow is corroborated: the destination is a
-    /// brand-new window (tab tear-off), or the anchor has stayed silent for
-    /// a very long time (no-event blind spots). Generic owner activity
-    /// deliberately does NOT corroborate: during a cross-display drag Safari
-    /// alternates which window reports the renderer, and the drag's own move
-    /// events must not legitimize following that alternation.
-    private func anchorFollowAllowed(
-        destinationID: String?,
-        missingTickCount: Int
-    ) -> Bool {
-        if let destinationID,
-           let firstSeen = windowFirstSeenTick[destinationID],
-           evidenceTickCounter - firstSeen
-               <= Self.anchorFollowNewWindowTicks {
-            return true
-        }
-        return missingTickCount >= Self.anchorFollowLongSilenceTicks
-    }
 
-    private func eventGateHolding(
-        state: AutomaticTrackingState,
-        evidence: WindowDisplayEvidence,
-        ownerPID: pid_t
-    ) -> Bool {
-        guard let anchorID = state.committedWindowIdentifier,
-              !evidence.candidateWindowIdentifiers.contains(anchorID) else {
-            state.anchorEventGateTickCount = 0
-            return false
-        }
-        let ticksSinceEvent = evidenceTickCounter
-            - (lastAXEventTickByPID[ownerPID] ?? 0)
-        let holding = ticksSinceEvent > Self.axEventGateWindowTicks
-            && state.anchorEventGateTickCount < Self.axEventGateMaximumTicks
-        if holding {
-            state.anchorEventGateTickCount += 1
-        }
-        return holding
-    }
 
-    private func evaluateOverviewHold() {
-        if overviewHoldActive {
-            overviewHoldRemainingTicks -= 1
-            var released = false
-            for state in automaticTracking.values {
-                if let anchorID = state.committedWindowIdentifier,
-                   let area = tickFrameAreas[anchorID],
-                   let baseline = windowFrameAreaHistory[anchorID],
-                   baseline > 0,
-                   area >= baseline * 0.9 {
-                    released = true
-                    break
-                }
-            }
-            var grewCount = 0
-            for (identifier, area) in tickFrameAreas {
-                if let previous = previousTickFrameAreas[identifier],
-                   previous > 0,
-                   area > previous * Self.overviewGrowRatio {
-                    grewCount += 1
-                }
-            }
-            if grewCount >= 1 || overviewHoldRemainingTicks <= 0 {
-                released = true
-            }
-            if released {
-                overviewHoldActive = false
-                diagnostics.record(
-                    "overview-hold-released",
-                    category: "routing"
-                )
-            }
-        } else {
-            var shrunkCount = 0
-            for (identifier, area) in tickFrameAreas {
-                if let baseline = windowFrameAreaHistory[identifier],
-                   baseline > 0,
-                   area < baseline * Self.overviewShrinkRatio {
-                    shrunkCount += 1
-                }
-            }
-            var anchorMissing = false
-            for state in automaticTracking.values {
-                if let anchorID = state.committedWindowIdentifier,
-                   tickFrameAreas[anchorID] == nil {
-                    anchorMissing = true
-                    break
-                }
-            }
-            if shrunkCount >= Self.overviewMinimumWindows
-                || (shrunkCount >= 1 && anchorMissing) {
-                overviewHoldActive = true
-                overviewHoldRemainingTicks = Self.overviewHoldMaximumTicks
-                diagnostics.record(
-                    "overview-hold-engaged",
-                    category: "routing"
-                )
-            }
-            // The baseline only advances while the overview is not
-            // active, so scaled frames never poison it.
-            windowFrameAreaHistory = tickFrameAreas
-        }
-        previousTickFrameAreas = tickFrameAreas
-    }
 
-    private func anchorIsTemporarilyInvisible(
-        state: AutomaticTrackingState,
+    /// Resolves the display of the largest surface candidate; used when the
+    /// anchor window is gone so the fullscreen surface can drive the display
+    /// without winning window selection.
+    private func surfaceDisplayUUID(
+        for identifiers: Set<String>,
         evidence: WindowDisplayEvidence?
-    ) -> Bool {
-        guard let anchorID = state.committedWindowIdentifier else { return false }
-        guard let evidence else { return true }
-        let currentIDs = Set(evidence.candidateWindowIdentifiers)
-        if currentIDs.contains(anchorID) { return false }
-        let ages = windowIdentifierAges[evidence.windowOwnerPID] ?? [:]
-        return !currentIDs.contains { identifier in
-            (ages[identifier] ?? 0) <= Self.freshMediaWindowAgeTicks
+    ) -> UUID? {
+        guard let evidence else { return nil }
+        let frames = identifiers.compactMap { identifier -> CGRect? in
+            evidence.candidateWindowFrames[identifier]
         }
+        let largest = frames.max { lhs, rhs in
+            (lhs.width * lhs.height) < (rhs.width * rhs.height)
+        }
+        guard let largest else { return nil }
+        return WindowDisplayPolicy.resolveDisplay(
+            for: largest,
+            displays: displays
+        )?.id
     }
 
     private func startAutomaticRoute(
@@ -2310,6 +2095,45 @@ final class AppModel: ObservableObject {
             publishRoutes()
         }
         updateAutomaticRoutingSummary()
+    }
+
+    /// Keeps a vanished source's route alive while a same-owner
+    /// replacement appears; migrates on the first hit and stops only when
+    /// the grace expires, so helper churn does not surface as an audible
+    /// stop/start loop.
+    private func scheduleVanishedSourceGrace(
+        for vanishedPID: pid_t,
+        state: AutomaticTrackingState?
+    ) {
+        diagnostics.record(
+            "route-grace-vanished-source",
+            category: "routing",
+            level: .warning
+        )
+        Task { [weak self] in
+            for delay in [300, 700, 1500, 3000] {
+                try? await Task.sleep(for: .milliseconds(delay))
+                guard !Task.isCancelled, let self else { return }
+                guard self.automaticRouteIDs[vanishedPID] != nil else {
+                    return
+                }
+                if let replacement = self.replacementSource(
+                    forVanishedPID: vanishedPID
+                ) {
+                    if let state {
+                        state.wasRunningOutput = true
+                        self.automaticTracking[replacement.pid] = state
+                    }
+                    await self.migrateAutomaticRoute(
+                        fromPID: vanishedPID,
+                        to: replacement
+                    )
+                    return
+                }
+            }
+            guard !Task.isCancelled, let self else { return }
+            await self.stopAutomaticRoute(for: vanishedPID)
+        }
     }
 
     /// Finds a running replacement source for a vanished one: same visible
@@ -2701,6 +2525,17 @@ final class AppModel: ObservableObject {
                     silentSeconds += 1
                 }
                 lastNonSilentFrameCount = nonSilentFrames
+                // Safari moves audio to a freshly spawned media process on
+                // fullscreen transitions while the old process stays alive in
+                // the table, so the tap keeps receiving silence and the real
+                // audio plays through the default device. While the tap is
+                // silent and a same-owner process is actually producing
+                // output, migrate the route to it (retried every few seconds
+                // until the replacement appears).
+                if silentSeconds >= Self.routeSilenceMigrateSeconds,
+                   silentSeconds % Self.routeSilenceMigrateRetrySeconds == 0 {
+                    await self.migrateSilentRouteIfReplacementAvailable(routeID)
+                }
                 if silentSeconds >= Self.routeSilenceSuspendSeconds {
                     diagnostics.record(
                         "route-suspended-for-silence",
@@ -2712,6 +2547,29 @@ final class AppModel: ObservableObject {
                 try? await Task.sleep(for: .seconds(1))
             }
         }
+    }
+
+    /// While the tap of a running route receives silence, Safari may have
+    /// moved its audio to a freshly spawned media process (fullscreen
+    /// transitions do exactly that without removing the old process from
+    /// the table). If a same-owner process is producing output, migrate the
+    /// route to it so the audio never falls back to the default device.
+    private func migrateSilentRouteIfReplacementAvailable(
+        _ routeID: UUID
+    ) async {
+        guard let session = sessions[routeID], session.state == .running,
+              let replacement = replacementSource(
+                  forVanishedPID: session.sourcePID
+              ) else { return }
+        diagnostics.record(
+            "route-migrated-silent-source",
+            category: "routing",
+            level: .warning
+        )
+        await migrateAutomaticRoute(
+            fromPID: session.sourcePID,
+            to: replacement
+        )
     }
 
     /// Tears down a running route after sustained silence while keeping the

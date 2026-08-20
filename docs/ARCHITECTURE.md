@@ -1,6 +1,6 @@
 # AudioOrbit Architecture
 
-**Version:** 0.3.11 (build 15) · **Updated:** 2026-08-17
+**Version:** 0.5.0 (build 23, unreleased) · **Updated:** 2026-08-20
 **Scope:** This is the single architecture document for AudioOrbit. It supersedes ADR-001 and the performance budgets document.
 
 ---
@@ -60,22 +60,65 @@ Each evidence refresh produces one WindowDisplayEvidence per playing source:
 
 - **AX windows** (via Accessibility): role, position, size, stable identifier and minimized state of focused/main/standard windows. Safari identifiers are normalized to their UUID segment (stableAXIdentifier) because the IsSecure flag flips during navigation.
 - **CG surfaces:** same-PID, on-screen, layer-0, alpha>0 surfaces only, matched to AX windows by largest overlap (≥50%) — stable identities where AX lacks one.
-- **Media indicator:** a uniquely matching playback marker in window chrome (mute/speaker/playing/audio and common CJK variants; depth ≤6; titles and web content are never read) can override focus selection.
+- **Media indicator:** a playback marker in window chrome (mute/speaker/playing/audio and common CJK variants; depth ≤6; titles and web content are never read) is recorded per window but deliberately NOT used for selection: Safari marks every window of the playing app, i.e. the marker follows focus, not playback.
 - **WebKit renderer PID:** parsed from BrowserView?IsPageLoaded=…&WebViewProcessID=NNN — the authoritative signal for which window is actually playing.
 
 ### 4.2 Window selection and display assignment
 
-- Selection order: **route anchor > unique media-indicator window > focused window > main window > largest visible window**.
-- Display assignment: largest intersection area between the window frame and each display frame, deterministic tie-breaking, boundary hysteresis.
+**The audio follows the window the video plays in — never focus.** The check runs
+only when an event triggers it (AX event, Space change, display
+reconfiguration, hardware reconciliation); the poll never re-judges.
+
+- Selection order:
+  1. **Fullscreen presentation** — a window reporting `AXFullScreen=true`
+     (WebKit video fullscreen presents as an AXDialog at the fullscreen
+     display's frame; the attribute lives on that dialog, not the browser
+     window).
+  2. **Renderer-PID anchor window** — the window reporting the anchored
+     WebViewProcessID, i.e. the window the video actually plays in.
+  3. **Focus → main → largest visible** fallback.
+- Safari's per-window **media marker is deliberately NOT used**: it follows
+  focus, not playback, so it would move the audio whenever focus moves.
+- Display assignment: largest intersection area between the window frame
+  and each display frame, deterministic tie-breaking, boundary hysteresis.
+- **Surfaces never anchor:** a pure surface (`isSurfaceOnly`, Safari's
+  fullscreen HTML-video surface) may drive the DISPLAY while the anchor is
+  gone, but can never become the anchor.
+- The committed display change goes through the route-side debounce queue
+  (§5.4): rapid A-B-A-B alternation is absorbed at the sink.
 
 ### 4.3 Anchor state machine (AppModel)
 
-- **Renderer PID first:** once anchored, the window reporting the anchored renderer PID is the playback window; focus changes never replace the anchor; moving the anchored window across displays migrates the route.
-- **Session boundary:** a stopped→running output transition is a new playback session (anchor released for re-selection), but the release is verified against renderer identity — pausing/resuming the same tab keeps the anchor (pendingSessionRelease), only a genuinely new renderer releases it.
-- **Time constants:** candidate dwell 3 ticks; temporarily missing anchor tolerance 6 ticks; staleness re-pin at 16 ticks; fullscreen/Space transitions keep the last output (anchorIsTemporarilyInvisible).
-- **Surfaces never anchor:** Safari's fullscreen HTML-video surface (`isSurfaceOnly`) is excluded at discovery from the renderer-PID map and the media-indicator list, so no follow path (count==1, dual-report freshness, media fallback, new-window corroboration) can ever adopt it. It still wins window selection and therefore drives the DISPLAY — fullscreen routing works without the anchor moving.
-- **Eventless display changes commit only after a long dwell:** window drags and Space transitions both emit NO AX events — the fallback scan is their only signal. Event-corroborated changes (focus, tear-off, create/destroy) commit immediately; eventless candidates must hold for 3 s. A Space-swipe animation (~1 s) never outlives the dwell, so animated frames cannot commit, while a real drag lands well inside it. Mission Control is additionally caught by the overview hold (area scaling).
-- **Helper-restart migration:** when a WebKit helper vanishes and a same-owner replacement exists, the route migrates to the replacement instead of falling back.
+The anchor remembers **which window the video plays in**. It is the pair
+**(renderer PID, current reporter window)** with exactly one writer in the
+decision path (scheduleAutomaticRouteDecision); every other path may only
+read it.
+
+- **Sticky renderer PID:** seeded once at first adoption from the window
+  selection picked at playback start, provided that window reports a
+  renderer PID (WebViewProcessID). It is never overwritten afterwards —
+  not by focus and not by the anchor window's own renderer. (The pre-0.5
+  re-adoption block did overwrite it and polluted the anchor with the
+  focused non-playing window's PID after fullscreen exit.)
+- **Reporter re-pin:** every tick the anchor window re-pins to whichever
+  window currently reports the anchored PID. A torn-off tab keeps its
+  renderer, so the new window becomes the anchor; churn windows that
+  transiently report the PID merely flip the display candidate, which the
+  route-side debounce absorbs.
+- **Long-gap release:** only when the anchored PID stays unreported for 24
+  consecutive ticks are the PID, the anchor window and the manual override
+  cleared together — a genuinely closed tab. Shorter gaps are churn.
+- **Session boundaries do NOT release:** a stopped→running output
+  transition records `playback-session-kept` and preserves the anchor;
+  helper restarts, fullscreen churn and pause/resume are not new playback
+  sessions.
+- **Manual pin:** the user-pinned window suppresses automatic following
+  until the long-gap release clears the override.
+- Adoption updates the anchor only; the display consequence flows through
+  the route-side debounce like every other change.
+- **Helper-restart migration:** when a WebKit helper vanishes and a
+  same-owner replacement exists, the route migrates instead of falling
+  back (grace period below).
 
 ### 4.4 Process ↔ window association
 
@@ -91,8 +134,9 @@ Four association paths: same process, regular parent chain (≤8 levels), unique
 |---|---|---|
 | AudioDeviceMonitor | kAudioHardwarePropertyDevices list changes; per-route destination DeviceIsAlive | 100 ms coalescing → hardware reconciliation |
 | AudioProcessActivityMonitor | **kAudioHardwarePropertyProcessObjectList changes** (a process establishing/tearing down its audio connection = playback start/stop/process churn) | 100 ms coalescing → reconciliation → evidence refresh |
-| AccessibilityWindowEventMonitor | AXObserver: window moved / resized / created / destroyed / focused / main (registered for the tracked window-owner PID set) | **150 ms debounce** → evidence refresh |
+| AccessibilityWindowEventMonitor | AXObserver: created / focused / main on the application element; moved / resized **on every AX window element** (AppKit forwards window notifications to app observers, Safari does not — per-window registration catches both). One AXObserver **per observed application** (`AXObserverCreate` takes the OBSERVED app's PID — a single getpid() observer silently failed with kAXErrorIllegalArgument and the app received no events for months). Window list re-synced on created events and every 2 s | **150 ms debounce** → selection check |
 | DisplayMonitor | CGDisplayRegisterReconfigurationCallback (display attach/detach/topology) | immediate evidence refresh |
+| NSWorkspace | **activeSpaceDidChangeNotification** (Space switches, fullscreen Spaces, Mission Control clicks — window frames do not move, so no AX event fires). A **trigger, not a judgment**: re-enumerate the tracked windows and run the selection check; the debounce absorbs the transition animation | window resync + selection check |
 | NSApplication.didBecomeActive | app activation | re-check accessibility permission |
 | CoreAudio process tap callbacks | per-route audio flow | health/clock analysis (real-time path: no allocation, no locks) |
 | Sparkle delegate | appcast loaded / update found / aborted | About-page status |
@@ -105,11 +149,11 @@ Not zero-polling. Exactly three polling loops remain, all deliberate:
 
 | Loop | Cadence | Why it must stay |
 |---|---|---|
-| **Observation loop** (ensureWindowObservation) | 250 ms while routes are active or sources are playing; 2 s otherwise | **Safety net:** ① dragging a tab into an existing window emits no AX event at all; ② some apps never emit window notifications; ③ fullscreen/Space edge cases. The 250 ms active cadence preserves drag-following feel |
-| Per-route health metrics | 1 s (only while a route runs) | buffer queue / clock drift monitoring |
+| **Observation loop** (ensureWindowObservation) | 250 ms while routes are active or sources are playing; 2 s otherwise | Maintains the display snapshot, the accessibility check, and the observer registrations, plus the hardware reconciliation every 4/8 ticks. **It never re-judges the window selection** — selection is event-driven only |
+| Per-route health metrics | 1 s (only while a route runs) | buffer queue / clock drift monitoring; silence-suspend and silent-source migration counters |
 | Gain-ramp completion wait | 2 ms (single shot, ≤250 ms, only during route start/stop) | transient startup/switch wait |
 
-Every other Task.sleep is a one-shot timer (100 ms hardware coalescing, 150 ms AX debounce, reconnect dwell, cleanup retry) — timing, not polling. Sparkle's own scheduled background checks (daily by default) are third-party.
+Every other Task.sleep is a one-shot timer (100 ms hardware coalescing, 150 ms AX debounce, follow-up reconcile series, vanish grace retries, commit retry) — timing, not polling. Sparkle's own scheduled background checks (daily by default) are third-party.
 
 ### 5.3 Energy budget and implementation
 
@@ -117,47 +161,53 @@ Every other Task.sleep is a one-shot timer (100 ms hardware coalescing, 150 ms A
 - Techniques: menu-bar icon update dedup (no per-tick re-render), adaptive tick cadence, 1 s TTL display snapshots with event-driven instant refresh, hardware reconciliation slowed to every 8 ticks while no routes exist.
 - The idle interval is the trade-off between new playback being picked up within ~2 s and wakeup count; playback start itself is already event-driven, so the poll is only the safety net.
 
-### 5.4 Tick-based decisions vs. AX events (audit)
+### 5.4 Decision and commit: route-side debounce queue
 
-Policy: tick counts are anti-flap debouncers, not detectors — detection is already
-event-driven. Each remaining tick decision is audited for event replacement:
+**Upstream never filters.** Every event (moved, focused, created, destroyed,
+Space change, process-table event) feeds the decision path unconditionally —
+there are no gates, no suppression windows, no event-type discrimination.
 
-| Decision | Ticks / delay | Defends against | Event replacement | Verdict |
-|---|---|---|---|---|
-| eventlessDisplayCommitDwell | 3 s | Space-swipe animation frames resolving to a neighbor display; transient geometry | Event-corroborated changes commit immediately; eventless candidates (drags, Space swipes — neither emits AX events) must hold 3 s, longer than any transition animation but inside a drag's landing | Event-first + long fallback dwell |
-| noEligibleWindowGrace | 1 s | pass-through during fullscreen entry | **Partial:** a destroyed event commits immediately; fullscreen entry emits none, so the grace stays | Partial |
-| mediaAnchorDwellTicks | 6 | media-indicator alternation between two windows | No: indicator appearance is poll data, not an event | Keep |
-| mediaAnchorMissToleranceTicks | 3 | indicator hiccup starvation | No event exists for "indicator momentarily missing" | Keep |
-| anchoredPIDMissingToleranceTicks | 6 | transient renderer report gaps | The gap is absence of data; the follow itself is corroborated by a brand-new destination or long silence (anchorFollowAllowed). **Destroyed event now skips the tolerance** | Keep + destroy acceleration |
-| anchorFollowNewWindow / LongSilenceTicks | 6 / 48 | MC alternation between fullscreen surface and desktop window; drag alternation between two real windows | Brand-new destination (created event proxy) or very long report silence. Generic owner activity (drag move events, focus changes) deliberately does NOT corroborate — it was legitimizing Safari's drag-time alternation | Event-first |
-| axEventGateWindow / MaximumTicks | 4 / 240 | anchor disappears without events (fullscreen transitions) | Already event-recency discrimination: missing anchor + no events = hold; real transitions fire events and clear it. Space swipes no longer need the gate — the 3 s eventless dwell covers them | Already event-first |
-| anchorStalenessTicks | 16 | re-pin after the anchor vanishes | **Destroyed event now re-pins immediately**; silent disappearance keeps the dwell | Partial |
-| anchorFreshnessAdvantageTicks + freshMediaWindowAgeTicks | 3 / 12 | dual-report freshness arbitration | Ages are poll data; no event exists | Keep |
-| playbackSessionSilenceTicks | 2 | stop→start boundary glitch | The process-table event already triggers the check; the 2-tick wait is anti-glitch | Keep |
-| overviewHoldMaximumTicks | 240 | MC hold backstop | MC emits no events (proven) — the backstop must be time-based | Keep |
-| routeSilenceSuspendSeconds | 60 | suspending silent routes | Frame-level silence counter (C bridge) is ground truth; stop fires the process-table event but pause does not | Keep |
-| hardware coalescing / reconnect / cleanup | 100 ms / 1 s / 1 s | event debounce, retry | Already event-shaped one-shot timers, not polling | N/A |
-| Observation loop | 250 ms / 2 s | safety net (tab-into-existing-window, apps that never emit events) | Spec §1.1 mandates the low-frequency scan stays | Keep |
+**The route side absorbs flapping.** Each committed candidate display change
+goes through a per-source queue with a trailing debounce:
 
-**Destroyed-event handling:** the AX observer now reports
-`kAXUIElementDestroyedNotification` per debounced batch. A destroyed window is
-gone for real, so the model skips tick-based waiting (stale-anchor dwell,
-missing-renderer tolerance, no-candidate grace) — the event answered what the
-ticks were guessing at. Fullscreen and Mission Control are still guarded by
-the invisibility / overview-hold / event-gate conditions.
+- Every candidate change restarts a **500 ms timer**; the actual device
+  switch fires only after the target display has held steady. Rapid
+  A-B-A-B alternation (fullscreen churn, Space-swipe animation frames,
+  Mission Control scaling) is absorbed at the sink.
+- **First routes and forced decisions commit immediately** (zero delay).
+- **A nil candidate never stops a route** — in every session state the
+  established route is kept; teardown has exactly four legal paths (§6).
+- **Transient target-resolution failure retries once after 500 ms** — after
+  a drag ends no further events arrive, so a dropped commit would leave the
+  drag permanently unfollowed.
+- Anchor adoption no longer bypasses the queue: adoption updates the anchor
+  only, and the display consequence flows through the debounce like every
+  other change.
 
----
+Remaining time-based values (the complete list):
+
+| Value | Purpose |
+|---|---|
+| 500 ms debounce | absorb rapid alternation at the sink |
+| 300/600/900/1500/2500/4000 ms follow-ups | detect launch-then-play output after the process-table event |
+| 300/700/1500/3000 ms vanish grace | find a same-owner replacement before tearing a route down |
+| 3 s / 5 s silence migration | move the route when the tap goes silent but a same-owner process plays (Safari swaps its media helper on fullscreen) |
+| 60 s silence suspend | tear down silent routes so the Mac can sleep (anchor and destination retained) |
+| 2-tick session silence | pause/resume boundary detection (anchor kept — diagnostic only) |
+| 24-tick anchor long-gap | renderer unreported ⇒ anchor release (closed tab) |
+
 
 ## 6. Key data flows
 
-playback starts:  process-table event → 100 ms coalesce → hardware reconciliation (full snapshot) → evidence refresh → 3-tick dwell → route creation
-window dragged across displays:  no AX events → fallback scan (250 ms) → candidate display change → 3 s eventless dwell → route migration (validate target → fade out → rebind → fade in)
-focus/tear-off change:  AX event → 150 ms debounce → evidence refresh → event-backed commit (no dwell)
-window closed:  AX destroyed → debounce → immediate re-pin / fallback, no staleness dwell
-tab torn out:  AX created → debounce → new window + same WebViewProcessID → anchor follows the new window
-tab dragged into existing window:  no event exists → 2 s safety-net poll → PID↔window mapping recomputed
-pause/resume:  process-table event → reconciliation → renderer identity check (same renderer keeps the anchor / new renderer releases and re-selects)
-helper restart:  process-table event → vanished-source detection → migration to the same-owner replacement
+playback starts:  process-table event → follow-up reconciles (300/600/900/1500/2500/4000 ms) → playback detected → selection check → first route (immediate)
+window dragged across displays:  AX moved (drag end) → selection check → candidate display change → 500 ms debounce → route migration (validate target → fade out → rebind → fade in)
+tab torn out:  AX created → debounce → the new window reports the same WebViewProcessID → anchor re-pins to the new reporter → display follows through the debounce
+fullscreen enter/exit:  Space change + AX window churn → selection check picks the AXFullScreen presentation (enter) or the anchor window (exit) → debounced commit; churn's transient windows cannot steal the anchor
+Mission Control / Space swipe:  no judgment — the selection check runs on the Space-change trigger, and the 500 ms debounce absorbs the animation frames
+window closed:  route stays on its display until the source process ends (vanish grace → migration → stop) or 60 s silence suspend
+pause/resume:  process-table event → reconciliation → anchor is kept (`playback-session-kept`); only the 24-tick long-gap rule releases it
+helper restart:  process-table event → vanished-source detection → vanish grace (300/700/1500/3000 ms) → migration to the same-owner replacement
+silent tap with a playing same-owner process:  route metrics → 3 s silence + every 5 s → silent-source migration
 
 ---
 

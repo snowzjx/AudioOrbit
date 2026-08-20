@@ -91,21 +91,6 @@ final class WindowDisplayPolicyTests: XCTestCase {
         XCTAssertTrue(WindowRouteAffinityPolicy.pinsInitialWindow(for: .parentApplication))
         XCTAssertTrue(WindowRouteAffinityPolicy.pinsInitialWindow(for: .matchingBundle))
         XCTAssertTrue(WindowRouteAffinityPolicy.pinsInitialWindow(for: .systemWebKitClient))
-        XCTAssertEqual(WindowRouteAffinityPolicy.routeAnchor(
-            existing: nil,
-            selected: "playing",
-            associationReason: .systemWebKitClient
-        ), "playing")
-        XCTAssertEqual(WindowRouteAffinityPolicy.routeAnchor(
-            existing: "playing",
-            selected: "focused-elsewhere",
-            associationReason: .systemWebKitClient
-        ), "playing")
-        XCTAssertNil(WindowRouteAffinityPolicy.routeAnchor(
-            existing: "playing",
-            selected: "focused-elsewhere",
-            associationReason: .sameProcess
-        ))
         XCTAssertFalse(WindowRouteAffinityPolicy.beginsNewPlaybackSession(
             wasRunningOutput: nil,
             isRunningOutput: true
@@ -132,36 +117,13 @@ final class WindowDisplayPolicyTests: XCTestCase {
         ))
     }
 
-    func testMediaTargetPrefersUniqueWindowThenFreshest() {
-        XCTAssertEqual(
-            WindowRouteAffinityPolicy.bestMediaTarget(["a"], ages: ["a": 5], freshWindowAgeTicks: 12),
-            "a"
-        )
-        XCTAssertEqual(
-            WindowRouteAffinityPolicy.bestMediaTarget(
-                ["old", "fresh"],
-                ages: ["old": 100, "fresh": 3],
-                freshWindowAgeTicks: 12
-            ),
-            "fresh"
-        )
-        XCTAssertNil(
-            WindowRouteAffinityPolicy.bestMediaTarget(
-                ["old1", "old2"],
-                ages: ["old1": 100, "old2": 101],
-                freshWindowAgeTicks: 12
-            )
-        )
-        XCTAssertNil(
-            WindowRouteAffinityPolicy.bestMediaTarget(
-                ["x", "y"],
-                ages: ["x": 2, "y": 2],
-                freshWindowAgeTicks: 12
-            )
-        )
-        XCTAssertNil(
-            WindowRouteAffinityPolicy.bestMediaTarget([], ages: [:], freshWindowAgeTicks: 12)
-        )
+    func testMediaTargetAdoptionRemovedWithDwellMachinery() {
+        // The dwell-based media arbitration was replaced by
+        // event-corroborated adoption; the policy helper is gone and the
+        // anchor decision lives in AppModel. Keep a placeholder so the
+        // suite still names the behavior it used to pin down.
+        XCTAssertTrue(WindowRouteAffinityPolicy.pinsInitialWindow(for: .parentApplication))
+        XCTAssertFalse(WindowRouteAffinityPolicy.pinsInitialWindow(for: .sameProcess))
     }
 
     func testSafariWindowIdentifierNormalizesToStableUUID() {

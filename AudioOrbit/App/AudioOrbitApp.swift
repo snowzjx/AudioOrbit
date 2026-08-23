@@ -127,6 +127,14 @@ private final class AudioOrbitStatusItemController: NSObject {
         statusMenu.addItem(routingToggleItem)
         statusMenu.addItem(.separator())
 
+        let about = NSMenuItem(
+            title: "About AudioOrbit",
+            action: #selector(openAboutPanel),
+            keyEquivalent: ""
+        )
+        about.target = self
+        statusMenu.addItem(about)
+
         let settings = NSMenuItem(
             title: "Settings…",
             action: #selector(openSettings),
@@ -173,6 +181,15 @@ private final class AudioOrbitStatusItemController: NSObject {
 
     @objc private func toggleRouting() {
         Task { await model.toggleAutomaticRouting() }
+    }
+
+    @objc private func openAboutPanel() {
+        // Let the status menu finish tracking before presenting the panel;
+        // AppKit can otherwise drop the activation request for an LSUIElement.
+        DispatchQueue.main.async {
+            NSApp.activate()
+            NSApp.orderFrontStandardAboutPanel(options: [:])
+        }
     }
 
     @objc private func openSettings() {

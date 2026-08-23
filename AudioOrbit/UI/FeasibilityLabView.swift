@@ -59,8 +59,15 @@ struct AudioOrbitSettingsView: View {
                         Text("Version \(marketingVersion) (\(buildNumber))")
                             .font(.callout)
                             .foregroundStyle(.secondary)
+                        Text("Created by Junxue Zhang")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
                     }
                 }
+
+                Text(copyrightNotice)
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
 
                 updateStatusView
 
@@ -126,6 +133,12 @@ struct AudioOrbitSettingsView: View {
 
     private var buildNumber: String {
         Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "—"
+    }
+
+    private var copyrightNotice: String {
+        Bundle.main.object(
+            forInfoDictionaryKey: "NSHumanReadableCopyright"
+        ) as? String ?? "Copyright © 2026 Junxue Zhang. All rights reserved."
     }
 
     private var displayMappings: some View {
@@ -326,46 +339,73 @@ struct AudioOrbitSettingsView: View {
     }
 
     private var permissions: some View {
-        GroupBox("Window access") {
-            VStack(alignment: .leading, spacing: 12) {
-                Label(
-                    model.accessibilityGranted ? "Accessibility is enabled" : "Accessibility is required",
-                    systemImage: model.accessibilityGranted
-                        ? "checkmark.circle.fill"
-                        : "hand.raised.fill"
-                )
-                .foregroundStyle(model.accessibilityGranted ? .green : .orange)
-                .accessibilityValue(
-                    model.accessibilityGranted ? "Granted" : "Not granted"
-                )
+        VStack(alignment: .leading, spacing: 18) {
+            GroupBox("Window access") {
+                VStack(alignment: .leading, spacing: 12) {
+                    Label(
+                        model.accessibilityGranted ? "Accessibility is enabled" : "Accessibility is required",
+                        systemImage: model.accessibilityGranted
+                            ? "checkmark.circle.fill"
+                            : "hand.raised.fill"
+                    )
+                    .foregroundStyle(model.accessibilityGranted ? .green : .orange)
+                    .accessibilityValue(
+                        model.accessibilityGranted ? "Granted" : "Not granted"
+                    )
 
-                Text("AudioOrbit uses Accessibility only to determine which display contains an application's window. It does not read window titles or screen pixels.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-
-                HStack {
-                    Button("Recheck") {
-                        Task { await model.recheckAccessibilityAccess() }
-                    }
-                    if !model.accessibilityGranted {
-                        Button("Open System Settings…") { model.openAccessibilitySettings() }
-                        Button("Grant Access…") {
-                            Task { await model.requestAccessibilityAccess() }
-                        }
-                        .buttonStyle(.borderedProminent)
-                    }
-                }
-
-                if let message = model.windowDiscoveryMessage {
-                    Text(message)
+                    Text("AudioOrbit uses Accessibility only to determine which display contains an application's window. It does not read window titles or screen pixels.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
+
+                    HStack {
+                        Button("Recheck") {
+                            Task { await model.recheckAccessibilityAccess() }
+                        }
+                        if !model.accessibilityGranted {
+                            Button("Open System Settings…") { model.openAccessibilitySettings() }
+                            Button("Grant Access…") {
+                                Task { await model.requestAccessibilityAccess() }
+                            }
+                            .buttonStyle(.borderedProminent)
+                        }
+                    }
+
+                    if let message = model.windowDiscoveryMessage {
+                        Text(message)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.top, 4)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.top, 4)
+
+            GroupBox("System audio access") {
+                VStack(alignment: .leading, spacing: 12) {
+                    Label(
+                        "Requested when the first route starts",
+                        systemImage: "waveform.circle"
+                    )
+                    .font(.subheadline.weight(.medium))
+
+                    Text("macOS asks for Screen & System Audio Recording access when AudioOrbit creates its first route. Audio is kept only in short-lived memory while it is sent to the selected output; it is never recorded, saved or transmitted.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    Text("If applications do not route after you answer the prompt, confirm that AudioOrbit is enabled in System Settings, then try playback again.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    Button("Open System Audio Settings…") {
+                        model.openSystemAudioRecordingSettings()
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.top, 4)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private var diagnostics: some View {

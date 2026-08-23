@@ -1,10 +1,10 @@
 # AudioOrbit — Project Specification
 
-**Document status:** Living product and implementation specification — v0.3.11 shipped (Developer ID, notarized, Sparkle updates); hardening continues
+**Document status:** Living product and implementation specification — v0.5.0 shipped (Developer ID, notarized, Sparkle updates); hardening continues
 **Target:** Native macOS menu-bar application
 **Minimum OS:** macOS 14.2
 **Primary language/UI:** Swift and SwiftUI, with Core Audio interop where required
-**Last updated:** 2026-08-17
+**Last updated:** 2026-08-23
 
 ## 1. Product summary
 
@@ -20,7 +20,7 @@ Example:
 
 > **AudioOrbit v1 routes per application/process, not per individual window.** If one process owns multiple windows on different displays, all audio emitted by that process is routed together using the process's selected active/primary window. AudioOrbit must not claim or attempt to route two windows from the same process to different devices.
 
-On macOS there is no public one-call API that sets an arbitrary output device for another application. AudioOrbit uses a Core Audio process tap to capture and suppress a process's normal output, then explicitly renders that audio to the selected hardware output. The current bridge is accepted for the integrated MVP (see `docs/ARCHITECTURE.md`); long-run latency evidence remains a release gate. Distribution is validated: Developer ID-signed, hardened-runtime, notarized, Sparkle-signed appcast releases shipped through v0.3.11.
+On macOS there is no public one-call API that sets an arbitrary output device for another application. AudioOrbit uses a Core Audio process tap to capture and suppress a process's normal output, then explicitly renders that audio to the selected hardware output. The current bridge is accepted for the integrated MVP (see `docs/ARCHITECTURE.md`); long-run latency evidence remains a release gate. Distribution is validated: Developer ID-signed, hardened-runtime, notarized, Sparkle-signed appcast releases shipped through v0.5.0.
 
 ## 2. Product goal
 
@@ -78,7 +78,7 @@ The following are explicitly outside v1:
 - Expect `AudioObjectID`, `CGDirectDisplayID`, and PID values to change between launches or reconnects.
 - Treat output devices as independently clocked. The bridge must tolerate sample-rate mismatch and drift rather than assuming identical clocks.
 - Never capture, persist, transmit, or analyze audio content beyond the in-memory buffers required to route it.
-- Debug builds use a stable local designated requirement for TCC continuity. Releases ship as Developer ID-signed, hardened-runtime, notarized builds updated through Sparkle (validated through v0.3.11). Note: TCC grants follow the code signature — re-signing or reinstalling resets the Accessibility grant, so day-to-day development should use Xcode Debug runs.
+- Debug builds use a stable local designated requirement for TCC continuity. Releases ship as Developer ID-signed, hardened-runtime, notarized builds updated through Sparkle (validated through v0.5.0). Note: TCC grants follow the code signature — re-signing or reinstalling resets the Accessibility grant, so day-to-day development should use Xcode Debug runs.
 - The direct-distribution application identifier is `me.snowzjx.AudioOrbit`. GitHub Releases are the initial delivery channel; the Mac App Store is not required for the first release.
 
 ## 6. MVP scope
@@ -95,7 +95,7 @@ The following are explicitly outside v1:
 - [x] Debounced rerouting when the selected window changes display.
 - [x] Safe fallback when the destination device or display disappears.
 - [x] Diagnostics view and previewable exportable text report containing anonymous metadata, health counters and coded events, never audio.
-- [x] Unit tests (60 deterministic policy tests). Integration and manual hardware tests remain open.
+- [x] Unit tests (76 deterministic policy tests). Integration and manual hardware tests remain open.
 
 ### Implemented product extensions
 
@@ -535,7 +535,7 @@ Tabs or sections:
 2. **General** — launch at login, follow notifications, ignored applications with **Allow Again** actions, plus Headphone Override configuration. Remembered routes are not edited here.
 3. **Permissions** — current permission state, explanations, recheck, and open-settings actions.
 4. **Support** — redacted diagnostics preview and support report.
-5. **About** — version/build, live update status, manual Check for Updates with error surfacing, last-check time.
+5. **About** — version/build, author and copyright, live update status, manual Check for Updates with error surfacing, last-check time. The status menu also exposes the native macOS About panel using the same bundle metadata.
 
 Raw process selection, buffer counters, manual feasibility controls, and OSStatus details are not exposed in the end-user Settings window. A separately gated support-report flow may expose redacted diagnostics in a later milestone.
 
@@ -703,7 +703,7 @@ Test on the minimum OS and the latest supported macOS release with:
 
 Automated tests must not assume particular hardware names or UIDs.
 
-The current automated suite contains 60 passing tests. Checked items above mean deterministic coverage exists in this repository; unchecked hardware and failure-injection items remain required even when related behavior has been exercised manually.
+The current automated suite contains 76 passing tests. Checked items above mean deterministic coverage exists in this repository; unchecked hardware and failure-injection items remain required even when related behavior has been exercised manually.
 
 ## 22. Milestones
 
@@ -755,7 +755,7 @@ Core feasibility is complete and `docs/ARCHITECTURE.md` documents the accepted a
 - [x] Add structured coded logs, signposts, counters, privacy-by-design redaction, preview and support report export.
 - [ ] Complete the hardware/OS/manual test matrix.
 - [x] Profile CPU/energy: idle CPU ≈0% measured (top/xctrace) after icon dedup, adaptive ticks and display-snapshot TTL. Memory, wakeups, audio latency and callback deadlines remain open.
-- [x] Verify signing/notarization/update behavior (Developer ID + hardened runtime + notarized + Sparkle releases through v0.3.11). Permission persistence is documented: TCC resets when the signature changes.
+- [x] Verify signing/notarization/update behavior (Developer ID + hardened runtime + notarized + Sparkle releases through v0.5.0). Permission persistence is documented: TCC resets when the signature changes.
 - [ ] Resolve all acceptance-criteria failures and document known limitations.
 
 ## 23. Acceptance criteria
@@ -867,7 +867,7 @@ Add new boundaries only when a milestone needs them; do not reorganize working r
 - Which production-quality converter should replace or validate the current adaptive linear interpolator?
 - What buffer sizes meet stability and wired-latency targets across built-in, USB, HDMI, and Bluetooth devices?
 - Does `mutedWhenTapped` provide the safest audible failover under every tested teardown and crash path?
-- (Resolved) Developer ID + hardened runtime + notarized + Sparkle updates shipped through v0.3.11. The Mac App Store remains out of scope for the first release.
+- (Resolved) Developer ID + hardened runtime + notarized + Sparkle updates shipped through v0.5.0. The Mac App Store remains out of scope for the first release.
 - Which applications or protected content types cannot be routed, and how can they be detected without false claims?
 - Which additional trusted helper families, if any, can be correlated without broadening capture to unrelated processes?
 

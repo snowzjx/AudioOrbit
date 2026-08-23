@@ -37,9 +37,29 @@ struct OnboardingView: View {
                 onboardingStep(
                     number: 3,
                     title: "Enable AudioOrbit",
-                    detail: "Use the menu-bar switch when setup is complete. The first route may also request System Audio Recording permission."
+                    detail: "Use the menu-bar switch when setup is complete. The first route may also request System Audio Recording permission. AudioOrbit uses one output per application, so separate windows from the same app cannot play through different outputs."
                 )
             }
+
+            Label(
+                model.accessibilityGranted
+                    ? "Window access granted — setup can be completed."
+                    : "Window access is required before setup can be completed.",
+                systemImage: model.accessibilityGranted
+                    ? "checkmark.circle.fill"
+                    : "exclamationmark.triangle.fill"
+            )
+            .font(.callout.weight(.medium))
+            .foregroundStyle(model.accessibilityGranted ? .green : .orange)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(12)
+            .background(
+                (model.accessibilityGranted ? Color.green : Color.orange).opacity(0.12),
+                in: RoundedRectangle(cornerRadius: 10)
+            )
+            .accessibilityValue(
+                model.accessibilityGranted ? "Permission granted" : "Permission required"
+            )
 
             HStack {
                 SettingsLink {
@@ -57,6 +77,12 @@ struct OnboardingView: View {
 
                 Button("Finish") { finish() }
                     .keyboardShortcut(.defaultAction)
+                    .disabled(!model.accessibilityGranted)
+                    .accessibilityHint(
+                        model.accessibilityGranted
+                            ? "Completes setup and closes this window"
+                            : "Grant Window Access before completing setup"
+                    )
             }
         }
         .padding(28)
@@ -99,7 +125,7 @@ final class OnboardingWindowController: NSWindowController, NSWindowDelegate {
     init(model: AppModel) {
         self.model = model
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 640, height: 520),
+            contentRect: NSRect(x: 0, y: 0, width: 640, height: 600),
             styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered,
             defer: false

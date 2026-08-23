@@ -43,7 +43,7 @@ Open `AudioOrbit.xcodeproj` and run the **AudioOrbit** scheme with Xcode 26 or a
 xcodebuild -project AudioOrbit.xcodeproj -scheme AudioOrbit test
 ```
 
-The automated suite contains 60 tests.
+The automated suite contains 76 tests.
 
 ## Documentation
 

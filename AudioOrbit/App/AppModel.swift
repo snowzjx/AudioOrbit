@@ -476,6 +476,13 @@ final class AppModel: ObservableObject {
         NSWorkspace.shared.open(url)
     }
 
+    func openSystemAudioRecordingSettings() {
+        guard let url = URL(
+            string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
+        ) else { return }
+        NSWorkspace.shared.open(url)
+    }
+
     func updateMapping(
         for displayUUID: UUID,
         selection: DisplayMappingSelection

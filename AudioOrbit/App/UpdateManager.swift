@@ -20,6 +20,7 @@ final class UpdateManager: NSObject, ObservableObject {
     @Published private(set) var lastCheckedAt: Date?
 
     private var updaterController: SPUStandardUpdaterController?
+    private var updaterOwnsRegularActivationPolicy = false
 
     private var isRunningTests: Bool {
         ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
@@ -59,15 +60,19 @@ final class UpdateManager: NSObject, ObservableObject {
     private func presentUpdaterUI() {
         if NSApp.activationPolicy() != .regular {
             NSApp.setActivationPolicy(.regular)
+            updaterOwnsRegularActivationPolicy = true
         }
         NSApp.activate()
     }
 
     private func restoreAccessoryPolicyIfIdle() {
-        if hasPendingUpdate { return }
-        if NSApp.activationPolicy() == .regular {
-            NSApp.setActivationPolicy(.accessory)
-        }
+        guard !hasPendingUpdate, updaterOwnsRegularActivationPolicy else { return }
+        updaterOwnsRegularActivationPolicy = false
+
+        // Settings and onboarding also use regular activation while their
+        // windows are visible. Do not hide one of those windows merely
+        // because Sparkle finished an update check.
+        ApplicationDockPresence.hideIfNoOtherUserWindow(excluding: nil)
     }
 
     private var hasPendingUpdate: Bool {

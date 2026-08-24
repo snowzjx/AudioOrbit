@@ -92,7 +92,10 @@ private final class AudioOrbitStatusItemController: NSObject {
 
         popover.behavior = .transient
         popover.animates = true
-        popover.contentSize = NSSize(width: 410, height: 560)
+        popover.contentSize = NSSize(
+            width: 410,
+            height: preferredPopoverHeight(on: NSScreen.main)
+        )
         popover.contentViewController = NSHostingController(
             rootView: MenuBarView(model: model)
         )
@@ -168,15 +171,81 @@ private final class AudioOrbitStatusItemController: NSObject {
             ? "Disable AudioOrbit"
             : "Enable AudioOrbit"
         updateIcon()
+
+        if popover.isShown {
+            let screen = popover.contentViewController?.view.window?.screen
+            updatePopoverSize(on: screen)
+        }
     }
 
     @objc private func handleLeftClick(_ sender: NSStatusBarButton) {
         if popover.isShown {
             popover.performClose(sender)
         } else {
+            updatePopoverSize(on: sender.window?.screen)
             popover.show(relativeTo: sender.bounds, of: sender, preferredEdge: .minY)
             popover.contentViewController?.view.window?.makeKey()
         }
+    }
+
+    private func preferredPopoverHeight(on screen: NSScreen?) -> CGFloat {
+        // Keep these values aligned with MenuBarView's padding and spacing.
+        // Route rows reserve enough room for their optional second detail line.
+        let outerVerticalPadding: CGFloat = 32
+        let headerHeight: CGFloat = 58
+        let overlayClearance: CGFloat = 26
+        let sectionSpacing: CGFloat = 15
+        let routeTitleHeight: CGFloat = 19
+        let routeTitleSpacing: CGFloat = 9
+        let routeRowHeight: CGFloat = 68
+        let routeRowSpacing: CGFloat = 9
+
+        let hasVolumeControls = model.devices.contains {
+            $0.isAlive && $0.isVolumeSettable && $0.volumeScalar != nil
+        }
+        // Collapsed Output Volume + divider + footer, or the footer alone.
+        let bottomControlsHeight: CGFloat = hasVolumeControls ? 94 : 52
+
+        let routeCount = max(model.routes.count, 1)
+        let routesHeight = routeTitleHeight
+            + routeTitleSpacing
+            + CGFloat(routeCount) * routeRowHeight
+            + CGFloat(max(routeCount - 1, 0)) * routeRowSpacing
+
+        var contentSectionHeights = [routesHeight]
+        if !model.accessibilityGranted {
+            contentSectionHeights.insert(100, at: 0)
+        }
+        if model.activeHeadphoneOverrideDevice != nil {
+            contentSectionHeights.insert(34, at: contentSectionHeights.count - 1)
+        }
+        if model.lastError != nil {
+            contentSectionHeights.append(34)
+        }
+
+        let contentHeight = contentSectionHeights.reduce(0, +)
+            + CGFloat(max(contentSectionHeights.count - 1, 0)) * sectionSpacing
+        let fittedHeight = outerVerticalPadding
+            + headerHeight
+            + overlayClearance
+            + contentHeight
+            + bottomControlsHeight
+
+        let desiredHeight = max(350, ceil(fittedHeight))
+        return min(desiredHeight, Self.maximumPopoverHeight(on: screen))
+    }
+
+    private func updatePopoverSize(on screen: NSScreen?) {
+        let height = preferredPopoverHeight(on: screen)
+        guard abs(popover.contentSize.height - height) > 1 else { return }
+        popover.contentSize = NSSize(width: 410, height: height)
+    }
+
+    private static func maximumPopoverHeight(on screen: NSScreen?) -> CGFloat {
+        let usableHeight = screen?.visibleFrame.height
+            ?? NSScreen.main?.visibleFrame.height
+            ?? 700
+        return floor(usableHeight * 0.8)
     }
 
     @objc private func toggleRouting() {

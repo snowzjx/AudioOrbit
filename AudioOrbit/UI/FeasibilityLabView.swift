@@ -7,25 +7,30 @@ struct AudioOrbitSettingsView: View {
     @ObservedObject var updateManager: UpdateManager
 
     var body: some View {
-        TabView {
-            settingsPage { displayMappings }
-                .tabItem { Label("Displays", systemImage: "display.2") }
+        ZStack {
+            LiquidGlassBackdrop()
 
-            settingsPage {
-                startup
-                headphoneOverride
-                ignoredApplications
+            TabView {
+                settingsPage { displayMappings }
+                    .tabItem { Label("Displays", systemImage: "display.2") }
+
+                settingsPage {
+                    startup
+                    headphoneOverride
+                    ignoredApplications
+                }
+                .tabItem { Label("General", systemImage: "gearshape") }
+
+                settingsPage { permissions }
+                    .tabItem { Label("Permissions", systemImage: "hand.raised") }
+
+                settingsPage { diagnostics }
+                    .tabItem { Label("Support", systemImage: "stethoscope") }
+
+                settingsPage { about }
+                    .tabItem { Label("About", systemImage: "info.circle") }
             }
-            .tabItem { Label("General", systemImage: "gearshape") }
-
-            settingsPage { permissions }
-                .tabItem { Label("Permissions", systemImage: "hand.raised") }
-
-            settingsPage { diagnostics }
-                .tabItem { Label("Support", systemImage: "stethoscope") }
-
-            settingsPage { about }
-                .tabItem { Label("About", systemImage: "info.circle") }
+            .padding(10)
         }
         .frame(
             minWidth: 700,
@@ -44,6 +49,8 @@ struct AudioOrbitSettingsView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(22)
         }
+        .scrollContentBackground(.hidden)
+        .groupBoxStyle(LiquidGlassGroupBoxStyle())
     }
 
     private var about: some View {
@@ -177,7 +184,7 @@ struct AudioOrbitSettingsView: View {
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(11)
-                    .background(.quaternary, in: RoundedRectangle(cornerRadius: 10))
+                    .liquidGlassPanel(cornerRadius: 12)
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -308,7 +315,7 @@ struct AudioOrbitSettingsView: View {
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(10)
-                        .background(.quaternary, in: RoundedRectangle(cornerRadius: 9))
+                        .liquidGlassPanel(cornerRadius: 12)
                     }
                 }
             }
@@ -451,9 +458,9 @@ struct AudioOrbitSettingsView: View {
                     }
                         .frame(height: 280)
                         .accessibilityLabel("Support report preview")
-                        .background(.background, in: RoundedRectangle(cornerRadius: 8))
+                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
                         .overlay {
-                            RoundedRectangle(cornerRadius: 8)
+                            RoundedRectangle(cornerRadius: 10)
                                 .stroke(.quaternary)
                         }
                 }

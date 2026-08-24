@@ -3,42 +3,99 @@ import SwiftUI
 
 struct MenuBarView: View {
     @ObservedObject var model: AppModel
+    @State private var isVolumeExpanded = false
+    @State private var headerHeight: CGFloat = 0
+    @State private var bottomControlsHeight: CGFloat = 0
 
     private var volumeDevices: [AudioDeviceSnapshot] {
         model.devices.filter { $0.isAlive && $0.isVolumeSettable && $0.volumeScalar != nil }
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            header
+        ZStack {
+            LiquidGlassBackdrop()
 
-            if !model.accessibilityGranted {
-                permissionBanner
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 15) {
+                    if !model.accessibilityGranted {
+                        permissionBanner
+                    }
+
+                    if let override = model.activeHeadphoneOverrideDevice {
+                        Label("Headphone Override · \(override.name)", systemImage: "headphones")
+                            .font(.caption.weight(.medium))
+                            .foregroundStyle(.tint)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(10)
+                            .popupContentCard(cornerRadius: 12)
+                    }
+
+                    routesSection
+
+                    if let lastError = model.lastError {
+                        Label(lastError, systemImage: "exclamationmark.triangle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                .padding(.trailing, 5)
             }
-
-            if let override = model.activeHeadphoneOverrideDevice {
-                Label("Headphone Override · \(override.name)", systemImage: "headphones")
-                    .font(.caption.weight(.medium))
-                    .foregroundStyle(.tint)
+            .scrollIndicators(.visible)
+            .scrollContentBackground(.hidden)
+            .background(Color.clear)
+            .contentMargins(
+                .top,
+                headerHeight + 13,
+                for: .scrollContent
+            )
+            .contentMargins(
+                .bottom,
+                bottomControlsHeight + 13,
+                for: .scrollContent
+            )
+            .contentMargins(
+                .top,
+                headerHeight + 6,
+                for: .scrollIndicators
+            )
+            .contentMargins(
+                .bottom,
+                bottomControlsHeight + 6,
+                for: .scrollIndicators
+            )
+            .overlay(alignment: .top) {
+                header
+                    .background {
+                        GeometryReader { proxy in
+                            Color.clear.preference(
+                                key: HeaderHeightPreferenceKey.self,
+                                value: proxy.size.height
+                            )
+                        }
+                    }
             }
-
-            routesSection
-
-            if !volumeDevices.isEmpty {
-                volumeSection
+            .overlay(alignment: .bottom) {
+                bottomControls
+                    .background {
+                        GeometryReader { proxy in
+                            Color.clear.preference(
+                                key: BottomControlsHeightPreferenceKey.self,
+                                value: proxy.size.height
+                            )
+                        }
+                    }
             }
-
-            if let lastError = model.lastError {
-                Label(lastError, systemImage: "exclamationmark.triangle.fill")
-                    .font(.caption)
-                    .foregroundStyle(.orange)
-                    .fixedSize(horizontal: false, vertical: true)
+            .onPreferenceChange(HeaderHeightPreferenceKey.self) {
+                headerHeight = $0
             }
-
-            footer
+            .onPreferenceChange(BottomControlsHeightPreferenceKey.self) {
+                bottomControlsHeight = $0
+            }
+            .padding(16)
         }
-        .padding(16)
         .frame(width: 410)
+        .frame(maxHeight: .infinity)
     }
 
     private var permissionBanner: some View {
@@ -65,7 +122,7 @@ struct MenuBarView: View {
             }
         }
         .padding(11)
-        .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 12))
+        .popupContentCard(cornerRadius: 14)
         .accessibilityElement(children: .contain)
     }
 
@@ -75,7 +132,7 @@ struct MenuBarView: View {
                 .font(.title2)
                 .frame(width: 34, height: 34)
                 .foregroundStyle(model.automaticRoutingEnabled ? Color.accentColor : .secondary)
-                .glassCard(cornerRadius: 12)
+                .liquidGlassPanel(cornerRadius: 12, tint: model.automaticRoutingEnabled ? .accentColor : nil)
                 .accessibilityHidden(true)
 
             VStack(alignment: .leading, spacing: 2) {
@@ -105,6 +162,8 @@ struct MenuBarView: View {
                             && model.headphoneOverrideDeviceUID == nil))
             )
         }
+        .padding(12)
+        .liquidGlassPanel(cornerRadius: 18, castsShadow: true)
     }
 
     private var routesSection: some View {
@@ -125,7 +184,7 @@ struct MenuBarView: View {
                     Spacer()
                 }
                 .padding(13)
-                .glassCard(cornerRadius: 14)
+                .popupContentCard(cornerRadius: 14)
             } else {
                 ForEach(model.routes) { route in
                     routeRow(route)
@@ -175,7 +234,7 @@ struct MenuBarView: View {
             .accessibilityLabel("Ignore \(route.sourceName)")
         }
         .padding(12)
-        .glassCard(cornerRadius: 14)
+        .popupContentCard(cornerRadius: 14)
         // Make the whole card the hit region for the context menu, not
         // just the text and buttons inside it.
         .contentShape(Rectangle())
@@ -266,50 +325,92 @@ struct MenuBarView: View {
         return resolved
     }
 
-    private var volumeSection: some View {
-        VStack(alignment: .leading, spacing: 9) {
-            Text("Output Volume")
-                .font(.subheadline.weight(.semibold))
-
-            ForEach(volumeDevices) { device in
-                VStack(alignment: .leading, spacing: 7) {
-                    HStack {
-                        Label(device.name, systemImage: device.isWirelessHeadphone ? "headphones" : "speaker.wave.2")
-                            .font(.caption.weight(.medium))
-                        Spacer()
-                        Text(Int((device.volumeScalar ?? 0) * 100), format: .number)
-                            .font(.caption.monospacedDigit())
-                            .foregroundStyle(.secondary)
+    private var volumePanel: some View {
+        DisclosureGroup(isExpanded: $isVolumeExpanded) {
+            VStack(spacing: 10) {
+                ForEach(Array(volumeDevices.enumerated()), id: \.element.id) { index, device in
+                    if index > 0 {
+                        Divider()
+                            .opacity(0.55)
                     }
-                    HStack(spacing: 9) {
-                        Image(systemName: "speaker.fill")
-                            .foregroundStyle(.secondary)
-                        Slider(
-                            value: Binding(
-                                get: { Double(device.volumeScalar ?? 0) },
-                                set: { value in
-                                    Task {
-                                        await model.setDeviceVolume(
-                                            deviceUID: device.uid,
-                                            scalar: value
-                                        )
-                                    }
-                                }
-                            ),
-                            in: 0...1
-                        )
-                        .accessibilityLabel("\(device.name) output volume")
-                        .accessibilityValue(
-                            "\(Int((device.volumeScalar ?? 0) * 100)) percent"
-                        )
-                        Image(systemName: "speaker.wave.3.fill")
-                            .foregroundStyle(.secondary)
-                    }
+                    volumeRow(device)
                 }
-                .padding(12)
-                .glassCard(cornerRadius: 14)
+            }
+            .padding(.top, 10)
+        } label: {
+            Label("Output Volume", systemImage: "speaker.wave.2")
+                .font(.subheadline.weight(.semibold))
+        }
+        .accessibilityHint(
+            isVolumeExpanded
+                ? "Collapse output volume controls"
+                : "Expand output volume controls"
+        )
+    }
+
+    private func volumeRow(_ device: AudioDeviceSnapshot) -> some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack {
+                Label(
+                    device.name,
+                    systemImage: device.isWirelessHeadphone ? "headphones" : "speaker.wave.2"
+                )
+                .font(.caption.weight(.medium))
+                Spacer()
+                Text(Int((device.volumeScalar ?? 0) * 100), format: .number)
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+            HStack(spacing: 9) {
+                Image(systemName: "speaker.fill")
+                    .foregroundStyle(.secondary)
+                Slider(
+                    value: Binding(
+                        get: { Double(device.volumeScalar ?? 0) },
+                        set: { value in
+                            let snappedValue = snappedVolume(value)
+                            Task {
+                                await model.setDeviceVolume(
+                                    deviceUID: device.uid,
+                                    scalar: snappedValue
+                                )
+                            }
+                        }
+                    ),
+                    in: 0...1
+                )
+                .controlSize(.large)
+                .frame(height: 26)
+                .contentShape(Rectangle())
+                .accessibilityLabel("\(device.name) output volume")
+                .accessibilityValue(
+                    "\(Int((device.volumeScalar ?? 0) * 100)) percent"
+                )
+                .accessibilityHint("Adjusts in 5 percent steps. Hold Shift for 1 percent steps.")
+                .help("5% steps · Hold Shift for 1% precision")
+                Image(systemName: "speaker.wave.3.fill")
+                    .foregroundStyle(.secondary)
             }
         }
+    }
+
+    private func snappedVolume(_ value: Double) -> Double {
+        let isFineAdjustment = NSEvent.modifierFlags.contains(.shift)
+        let step = isFineAdjustment ? 0.01 : 0.05
+        return min(max((value / step).rounded() * step, 0), 1)
+    }
+
+    private var bottomControls: some View {
+        VStack(spacing: 12) {
+            if !volumeDevices.isEmpty {
+                volumePanel
+                Divider()
+                    .opacity(0.55)
+            }
+            footer
+        }
+        .padding(12)
+        .liquidGlassPanel(cornerRadius: 18, castsShadow: true)
     }
 
     private var footer: some View {
@@ -382,13 +483,18 @@ struct MenuBarView: View {
     }
 }
 
-private extension View {
-    @ViewBuilder
-    func glassCard(cornerRadius: CGFloat) -> some View {
-        if #available(macOS 26.0, *) {
-            self.glassEffect(.regular, in: .rect(cornerRadius: cornerRadius))
-        } else {
-            self.background(.regularMaterial, in: RoundedRectangle(cornerRadius: cornerRadius))
-        }
+private struct HeaderHeightPreferenceKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
+private struct BottomControlsHeightPreferenceKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
     }
 }

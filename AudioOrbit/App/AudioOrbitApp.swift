@@ -110,12 +110,9 @@ private final class AudioOrbitStatusItemController: NSObject {
 
     private func configureStatusButton() {
         guard let button = statusItem.button else { return }
-        // Swap in a button subclass so left clicks open the popover while
-        // right clicks fall through to AppKit, which presents
-        // statusItem.menu natively (system header, positioning, highlight).
-        object_setClass(button, AudioOrbitStatusBarButton.self)
         button.target = self
-        button.action = #selector(handleLeftClick(_:))
+        button.action = #selector(handleStatusButtonClick(_:))
+        button.sendAction(on: [.leftMouseUp, .rightMouseUp])
         button.toolTip = "AudioOrbit — right-click to enable or disable"
         button.setAccessibilityLabel("AudioOrbit")
         button.setAccessibilityHelp(
@@ -163,7 +160,6 @@ private final class AudioOrbitStatusItemController: NSObject {
         quit.target = self
         statusMenu.addItem(quit)
 
-        statusItem.menu = statusMenu
     }
 
     private func refresh() {
@@ -178,7 +174,12 @@ private final class AudioOrbitStatusItemController: NSObject {
         }
     }
 
-    @objc private func handleLeftClick(_ sender: NSStatusBarButton) {
+    @objc private func handleStatusButtonClick(_ sender: NSStatusBarButton) {
+        if NSApp.currentEvent?.type == .rightMouseUp {
+            presentStatusMenu(from: sender)
+            return
+        }
+
         if popover.isShown {
             popover.performClose(sender)
         } else {
@@ -186,6 +187,15 @@ private final class AudioOrbitStatusItemController: NSObject {
             popover.show(relativeTo: sender.bounds, of: sender, preferredEdge: .minY)
             popover.contentViewController?.view.window?.makeKey()
         }
+    }
+
+    private func presentStatusMenu(from sender: NSStatusBarButton) {
+        // Assign the menu only while AppKit is tracking it. Keeping a menu on
+        // the status item makes AppKit consume left clicks before the button's
+        // action can open the popover.
+        statusItem.menu = statusMenu
+        sender.performClick(nil)
+        statusItem.menu = nil
     }
 
     private func preferredPopoverHeight(on screen: NSScreen?) -> CGFloat {
@@ -322,17 +332,5 @@ private final class AudioOrbitStatusItemController: NSObject {
             button.setAccessibilityValue("AudioOrbit is \(state)")
             lastIconAccessibilityState = state
         }
-    }
-}
-
-/// Left clicks are claimed by the controller (popover); right clicks are
-/// forwarded to AppKit so it presents the status item's menu natively.
-private final class AudioOrbitStatusBarButton: NSStatusBarButton {
-    override func mouseDown(with event: NSEvent) {
-        _ = sendAction(action, to: target)
-    }
-
-    override func rightMouseDown(with event: NSEvent) {
-        super.rightMouseDown(with: event)
     }
 }

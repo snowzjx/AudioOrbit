@@ -5,6 +5,7 @@ import SwiftUI
 struct AudioOrbitSettingsView: View {
     @ObservedObject var model: AppModel
     @ObservedObject var updateManager: UpdateManager
+    @State private var displayPendingRemoval: DisplayMappingRow?
 
     var body: some View {
         ZStack {
@@ -157,11 +158,26 @@ struct AudioOrbitSettingsView: View {
 
                 ForEach(model.mappingRows) { row in
                     VStack(alignment: .leading, spacing: 7) {
-                        Label(
-                            row.displayName,
-                            systemImage: row.isBuiltIn ? "laptopcomputer" : "display"
-                        )
-                        .font(.subheadline.weight(.medium))
+                        HStack {
+                            Label(
+                                row.displayName,
+                                systemImage: row.isBuiltIn ? "laptopcomputer" : "display"
+                            )
+                            .font(.subheadline.weight(.medium))
+
+                            Spacer()
+
+                            if !row.isDisplayConnected {
+                                Button(role: .destructive) {
+                                    displayPendingRemoval = row
+                                } label: {
+                                    Label("Forget", systemImage: "trash")
+                                }
+                                .buttonStyle(.borderless)
+                                .help("Forget this disconnected display and its audio mapping")
+                                .accessibilityLabel("Forget \(row.displayName)")
+                            }
+                        }
 
                         Picker("Audio output", selection: mappingBinding(for: row)) {
                             Text("Use System Default").tag(DisplayMappingSelection.passThrough)
@@ -177,7 +193,7 @@ struct AudioOrbitSettingsView: View {
                         .accessibilityHint("Select the output used by applications on \(row.displayName)")
 
                         if !row.isDisplayConnected {
-                            Label("This display is not connected. Its mapping is remembered.", systemImage: "info.circle")
+                            Label("This display is not connected. Its mapping is remembered until you forget it.", systemImage: "info.circle")
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
                         }
@@ -191,6 +207,16 @@ struct AudioOrbitSettingsView: View {
             .padding(.top, 4)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        .alert(item: $displayPendingRemoval) { row in
+            Alert(
+                title: Text("Forget \(row.displayName)?"),
+                message: Text("Its saved audio output will be removed. If you reconnect this display, AudioOrbit will add it again using System Default."),
+                primaryButton: .destructive(Text("Forget Display")) {
+                    Task { await model.forgetDisplayMapping(for: row.displayUUID) }
+                },
+                secondaryButton: .cancel()
+            )
+        }
     }
 
     private var startup: some View {

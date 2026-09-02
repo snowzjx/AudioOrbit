@@ -199,6 +199,29 @@ final class DisplayAudioMappingTests: XCTestCase {
         ).isValid)
     }
 
+    @MainActor
+    func testForgettingDisconnectedDisplayRemovesPersistedMapping() async throws {
+        let store = try temporaryStore()
+        let mapping = DisplayAudioMapping(
+            displayUUID: displaySnapshot().id,
+            displayNameHint: "Old Studio Display",
+            audioDeviceUID: "output-1",
+            audioDeviceNameHint: "Desk Speakers",
+            behavior: .routeToDevice
+        )
+        try store.save(PersistedConfiguration(
+            schemaVersion: PersistedConfiguration.currentSchemaVersion,
+            mappings: [mapping],
+            routingEnabled: false
+        ))
+        let model = AppModel(mappingStore: store, startsServices: false)
+
+        await model.forgetDisplayMapping(for: mapping.displayUUID)
+
+        XCTAssertTrue(model.mappings.isEmpty)
+        XCTAssertTrue(store.load().configuration.mappings.isEmpty)
+    }
+
     private func temporaryStore() throws -> MappingStore {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("AudioOrbitMappingTests-\(UUID().uuidString)", isDirectory: true)

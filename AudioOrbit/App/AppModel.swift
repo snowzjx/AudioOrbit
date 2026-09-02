@@ -511,6 +511,21 @@ final class AppModel: ObservableObject {
         }
     }
 
+    func forgetDisplayMapping(for displayUUID: UUID) async {
+        guard !displays.contains(where: { $0.id == displayUUID }),
+              let index = mappings.firstIndex(where: { $0.displayUUID == displayUUID }) else {
+            return
+        }
+
+        mappings.remove(at: index)
+        persistConfiguration()
+
+        if automaticRoutingEnabled {
+            ensureWindowObservation()
+            await refreshAutomaticWindowEvidence(forceImmediate: true)
+        }
+    }
+
     func setDeviceVolume(deviceUID: String, scalar: Double) async {
         guard let index = devices.firstIndex(where: { $0.uid == deviceUID && $0.isAlive }) else {
             lastError = "That audio output is no longer connected."

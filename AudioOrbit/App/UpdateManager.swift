@@ -18,6 +18,7 @@ enum UpdateStatus: Equatable {
 final class UpdateManager: NSObject, ObservableObject {
     @Published private(set) var status: UpdateStatus = .idle
     @Published private(set) var lastCheckedAt: Date?
+    @Published private(set) var hasUnattendedUpdate = false
 
     private var updaterController: SPUStandardUpdaterController?
     private var updaterOwnsRegularActivationPolicy = false
@@ -31,7 +32,7 @@ final class UpdateManager: NSObject, ObservableObject {
         updaterController = SPUStandardUpdaterController(
             startingUpdater: true,
             updaterDelegate: self,
-            userDriverDelegate: nil
+            userDriverDelegate: self
         )
     }
 
@@ -40,6 +41,7 @@ final class UpdateManager: NSObject, ObservableObject {
             status = .failed("The updater is unavailable in this build.")
             return
         }
+        hasUnattendedUpdate = false
         status = .checking
         // Menu actions run while the menu is still tracking; an activation
         // request made from that context is dropped by AppKit, which leaves
@@ -75,7 +77,7 @@ final class UpdateManager: NSObject, ObservableObject {
         ApplicationDockPresence.hideIfNoOtherUserWindow(excluding: nil)
     }
 
-    private var hasPendingUpdate: Bool {
+    var hasPendingUpdate: Bool {
         if case .updateAvailable = status { return true }
         return false
     }
@@ -115,5 +117,36 @@ extension UpdateManager: SPUUpdaterDelegate {
         }
         lastCheckedAt = Date()
         restoreAccessoryPolicyIfIdle()
+    }
+}
+
+extension UpdateManager: @preconcurrency SPUStandardUserDriverDelegate {
+    var supportsGentleScheduledUpdateReminders: Bool { true }
+
+    func standardUserDriverShouldHandleShowingScheduledUpdate(
+        _ update: SUAppcastItem,
+        andInImmediateFocus immediateFocus: Bool
+    ) -> Bool {
+        // Sparkle may present an update immediately when it knows the alert
+        // will receive attention. Otherwise, keep the alert out of the
+        // background and advertise it through AudioOrbit's menu-bar item.
+        immediateFocus
+    }
+
+    func standardUserDriverWillHandleShowingUpdate(
+        _ handleShowingUpdate: Bool,
+        forUpdate update: SUAppcastItem,
+        state: SPUUserUpdateState
+    ) {
+        status = .updateAvailable(version: update.displayVersionString)
+        hasUnattendedUpdate = !handleShowingUpdate && !state.userInitiated
+    }
+
+    func standardUserDriverDidReceiveUserAttention(forUpdate update: SUAppcastItem) {
+        hasUnattendedUpdate = false
+    }
+
+    func standardUserDriverWillFinishUpdateSession() {
+        hasUnattendedUpdate = false
     }
 }

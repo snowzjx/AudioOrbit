@@ -14,6 +14,8 @@ jobs:
     runs-on: macos-26
     steps:
       - uses: actions/checkout@v7
+      - name: Test desktop runner assertions and local fixture server
+        run: python3 -m unittest discover -s tools/e2e/tests -v
       - name: Build and test
         run: |
           TEST_INFO_PLIST="$RUNNER_TEMP/AudioOrbit-TestHost-Info.plist"

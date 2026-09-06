@@ -4,3 +4,4 @@ build/
 xcuserdata/
 .DS_Store
 *.profraw
+__pycache__/

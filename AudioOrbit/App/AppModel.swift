@@ -137,6 +137,7 @@ final class AppModel: ObservableObject {
     private let mappingStore: MappingStore
     private let diagnostics: DiagnosticsRecorder
     private let onboardingStore: OnboardingStateStore
+    private let preferences: UserDefaults
     private let launchDate = Date()
     private var sessions: [UUID: RouteSession] = [:]
     private var routeOrder: [UUID] = []
@@ -243,14 +244,16 @@ final class AppModel: ObservableObject {
         mappingStore: MappingStore = MappingStore(),
         startsServices: Bool = true,
         diagnostics: DiagnosticsRecorder = .shared,
-        onboardingStore: OnboardingStateStore = OnboardingStateStore()
+        onboardingStore: OnboardingStateStore = OnboardingStateStore(),
+        preferences: UserDefaults = .standard
     ) {
         self.mappingStore = mappingStore
         self.diagnostics = diagnostics
         self.onboardingStore = onboardingStore
+        self.preferences = preferences
         hasCompletedOnboarding = onboardingStore.isCompleted
         launchAtLoginEnabled = LaunchAtLogin.isEnabled
-        followNotificationsEnabled = UserDefaults.standard.bool(
+        followNotificationsEnabled = preferences.bool(
             forKey: Self.followNotificationsDefaultsKey
         )
         let loadedConfiguration = mappingStore.load()
@@ -355,7 +358,7 @@ final class AppModel: ObservableObject {
 
     func setFollowNotificationsEnabled(_ enabled: Bool) async {
         followNotificationsEnabled = enabled
-        UserDefaults.standard.set(enabled, forKey: Self.followNotificationsDefaultsKey)
+        preferences.set(enabled, forKey: Self.followNotificationsDefaultsKey)
         if enabled {
             do {
                 let granted = try await UNUserNotificationCenter.current()
@@ -1034,6 +1037,43 @@ final class AppModel: ObservableObject {
     func applicationWillTerminate() {
         tearDownForTermination()
     }
+
+    #if AUDIOORBIT_E2E
+    func e2eSnapshot() -> [String: Any] {
+        let live: [[String: Any]] = sessions.values.map { session in
+            // Async destination changes may be disposing the old renderer.
+            // Observe only settled sessions; do not race their lifecycle.
+            let canRead = session.state == .running && session.switchTask == nil
+            let metrics = canRead ? session.probe.metricsSnapshot() : TapProbeMetrics()
+            let tracking = automaticTracking[session.sourcePID]
+            var item: [String: Any] = [
+                "generation": session.id.uuidString,
+                "sourcePID": session.sourcePID,
+                "bundleID": session.applicationBundleIdentifier ?? "",
+                "automatic": session.isAutomatic,
+                "state": String(describing: session.state),
+                "requestedUID": session.destinationUID,
+                "rendererStarted": canRead && session.probe.e2eRendererStarted,
+                "displayUUID": session.followedDisplayUUID?.uuidString ?? "",
+                "pendingDisplayUUID": tracking?.candidateDisplayUUID?.uuidString ?? "",
+                "windowID": tracking?.committedWindowIdentifier ?? "",
+                "captured": metrics.capturedFrameCount,
+                "rendered": metrics.renderedFrameCount,
+                "nonSilent": metrics.nonSilentFrameCount,
+                "captureCallbacks": metrics.callbackCount,
+                "renderCallbacks": metrics.rendererCallbackCount,
+                "underflow": metrics.underflowFrameCount,
+                "overflow": metrics.overflowFrameCount,
+                "queued": metrics.queuedFrameCount
+            ]
+            do { item["actualUID"] = canRead ? try session.probe.e2eRendererUID() ?? "" : "" }
+            catch { item["bindingError"] = String(describing: error) }
+            return item
+        }
+        return ["routes": live, "accessibility": AccessibilityPermission.isGranted,
+                "enabled": automaticRoutingEnabled, "error": lastError ?? ""]
+    }
+    #endif
 
     private func tearDownForTermination() {
         guard !hasPerformedTerminationCleanup else { return }

@@ -25,6 +25,17 @@ final class AudioOrbitAppDelegate: NSObject, NSApplicationDelegate {
     private var onboardingWindowController: OnboardingWindowController?
     let updateManager = UpdateManager()
     private let isRunningTests: Bool
+    #if AUDIOORBIT_E2E
+    private let e2e = E2EObservation.fromArguments()
+    #endif
+
+    private var suppressLaunchServices: Bool {
+        #if AUDIOORBIT_E2E
+        return isRunningTests || e2e != nil
+        #else
+        return isRunningTests
+        #endif
+    }
 
     override init() {
         isRunningTests = ProcessInfo.processInfo.environment[
@@ -40,7 +51,16 @@ final class AudioOrbitAppDelegate: NSObject, NSApplicationDelegate {
                 startsServices: false
             )
         } else {
+            #if AUDIOORBIT_E2E
+            guard let e2e else { fatalError("E2E build requires --e2e-directory") }
+            model = AppModel(
+                mappingStore: MappingStore(fileURL: e2e.directory.appendingPathComponent("mappings.json")),
+                onboardingStore: OnboardingStateStore(defaults: e2e.preferences),
+                preferences: e2e.preferences
+            )
+            #else
             model = AppModel()
+            #endif
         }
         super.init()
     }
@@ -51,17 +71,20 @@ final class AudioOrbitAppDelegate: NSObject, NSApplicationDelegate {
             model: model,
             updateManager: updateManager
         )
-        if !isRunningTests {
+        #if AUDIOORBIT_E2E
+        e2e?.start(model: model)
+        #endif
+        if !suppressLaunchServices {
             updateManager.startUpdaterIfNeeded()
         }
-        if !isRunningTests, CommandLine.arguments.contains("--check-updates") {
+        if !suppressLaunchServices, CommandLine.arguments.contains("--check-updates") {
             // Diagnostic hook: trigger an update check shortly after launch
             // so failures can be observed in the unified log.
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
                 self?.updateManager.checkForUpdates()
             }
         }
-        if !isRunningTests, !model.hasCompletedOnboarding {
+        if !suppressLaunchServices, !model.hasCompletedOnboarding {
             let controller = OnboardingWindowController(model: model)
             onboardingWindowController = controller
             controller.present()
@@ -69,6 +92,9 @@ final class AudioOrbitAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        #if AUDIOORBIT_E2E
+        e2e?.stop()
+        #endif
         model.applicationWillTerminate()
     }
 }

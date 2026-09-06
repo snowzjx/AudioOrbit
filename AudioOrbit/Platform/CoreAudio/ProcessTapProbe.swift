@@ -14,6 +14,15 @@ final class ProcessTapProbe {
     private var gainRampFrames: UInt32 = 0
     private(set) var currentDestinationDeviceID: AudioObjectID?
 
+    #if AUDIOORBIT_E2E
+    var e2eRendererStarted: Bool { outputRenderer?.isStarted == true }
+
+    func e2eRendererUID() throws -> String? {
+        guard let id = try outputRenderer?.verifiedDeviceID() else { return nil }
+        return try CoreAudioProperty.string(objectID: id, selector: kAudioDevicePropertyDeviceUID)
+    }
+    #endif
+
     var isRunning: Bool { ioProcID != nil }
     var hasActiveRoute: Bool {
         isRunning && outputRenderer != nil && bridge != nil

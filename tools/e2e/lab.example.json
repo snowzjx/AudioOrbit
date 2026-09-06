@@ -1,0 +1,9 @@
+{
+  "targets": [
+    {"displayUUID": "REPLACE_WITH_DISPLAY_A_UUID", "outputUID": "REPLACE_WITH_OUTPUT_A_UID"},
+    {"displayUUID": "REPLACE_WITH_DISPLAY_B_UUID", "outputUID": "REPLACE_WITH_OUTPUT_B_UID"}
+  ],
+  "initialTimeout": 15,
+  "moveTimeout": 5,
+  "holdSeconds": 1
+}

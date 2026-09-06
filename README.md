@@ -43,9 +43,10 @@ Open `AudioOrbit.xcodeproj` and run the **AudioOrbit** scheme with Xcode 26 or a
 xcodebuild -project AudioOrbit.xcodeproj -scheme AudioOrbit test
 ```
 
-The automated suite contains 76 tests.
+The app suite contains 77 tests, and the smoke framework has 19 Python checks; both suites are included in GitHub-hosted CI. A separate Safari smoke runner automates display-to-display drags and verifies the actual audio renderer output in software. Its first live A → B → A and silent-window focus run passed. Live smoke tests need a local or dedicated self-hosted Mac with two displays and outputs; see [setup, commands, and CI coverage](tools/e2e/README.md).
 
 ## Documentation
 
 - [Product specification](PROJECT_SPEC.md)
 - [Architecture](docs/ARCHITECTURE.md)
+- [Automated display-following test design](docs/AUTOMATED_TESTING.md)

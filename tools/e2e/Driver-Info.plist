@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleIdentifier</key><string>me.snowzjx.AudioOrbit.E2EDriver</string>
+<key>CFBundleExecutable</key><string>AudioOrbitE2EDriver</string>
+<key>CFBundleName</key><string>AudioOrbit E2E Driver</string>
+<key>CFBundleDisplayName</key><string>AudioOrbit E2E Driver</string>
+<key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+<key>CFBundleShortVersionString</key><string>1.0</string>
+<key>CFBundleSupportedPlatforms</key><array><string>MacOSX</string></array>
+<key>LSMinimumSystemVersion</key><string>14.2</string>
+<key>AudioOrbitE2ELocalIdentity</key><string>6BE782BB-6D3B-41DB-B44B-E6495F3C3A64</string>
+<key>CFBundlePackageType</key><string>APPL</string>
+<key>CFBundleVersion</key><string>1</string>
+<key>LSUIElement</key><true/>
+<key>NSAppleEventsUsageDescription</key><string>Create and close only the Safari video windows owned by the AudioOrbit test run.</string>
+</dict></plist>

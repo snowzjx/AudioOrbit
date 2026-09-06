@@ -8,6 +8,21 @@ final class PhysicalOutputRenderer {
 
     var requiresCleanup: Bool { audioUnit != nil }
 
+    #if AUDIOORBIT_E2E
+    // Read the actual HAL binding, never the requested destination cached by
+    // the route. Called on the main actor, outside the render callback.
+    func verifiedDeviceID() throws -> AudioObjectID? {
+        guard let audioUnit else { return nil }
+        var deviceID = AudioObjectID(kAudioObjectUnknown)
+        var size = UInt32(MemoryLayout.size(ofValue: deviceID))
+        try requireNoErr(AudioUnitGetProperty(
+            audioUnit, kAudioOutputUnitProperty_CurrentDevice,
+            kAudioUnitScope_Global, 0, &deviceID, &size
+        ), operation: "Read back the HAL output device")
+        return deviceID
+    }
+    #endif
+
     func prepare(
         deviceID: AudioObjectID,
         clientFormat: AudioStreamBasicDescription,

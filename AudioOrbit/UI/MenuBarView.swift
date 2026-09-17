@@ -3,6 +3,7 @@ import SwiftUI
 
 struct MenuBarView: View {
     @ObservedObject var model: AppModel
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var isVolumeExpanded = false
     @State private var headerHeight: CGFloat = 0
     @State private var bottomControlsHeight: CGFloat = 0
@@ -411,6 +412,12 @@ struct MenuBarView: View {
         }
         .padding(12)
         .liquidGlassPanel(cornerRadius: 18, castsShadow: true)
+        // Animate the whole panel so the glass follows the disclosure's size.
+        // NSPopover.animates only controls opening and closing the popover.
+        .animation(
+            reduceMotion ? nil : .easeInOut(duration: 0.22),
+            value: isVolumeExpanded
+        )
     }
 
     private var footer: some View {

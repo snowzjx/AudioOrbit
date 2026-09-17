@@ -37,7 +37,7 @@ Safari media routes stay anchored to the window where playback began, so using a
 
 ## Build and test
 
-Open `AudioOrbit.xcodeproj` and run the **AudioOrbit** scheme with Xcode 26 or a compatible Xcode containing the macOS Core Audio process-tap SDK.
+Open `AudioOrbit.xcodeproj` and run the **AudioOrbit** scheme with Xcode 27. CI tests and release builds use GitHub's `xcode-27` runner with Xcode 27.0.
 
 ```sh
 xcodebuild -project AudioOrbit.xcodeproj -scheme AudioOrbit test
